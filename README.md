@@ -1,1 +1,2 @@
 # kimo
+![](assets/kimo.png)
