@@ -1,5 +1,5 @@
-# Build output
-kimo
+# Build output (root-level binary)
+/kimo
 dist/
 
 # IDE
