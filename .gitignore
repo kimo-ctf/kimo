@@ -1,0 +1,14 @@
+# Build output
+kimo
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Config (contains secrets)
+kimo.yaml
+
+# OS
+.DS_Store

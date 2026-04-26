@@ -1,0 +1,49 @@
+# kimo example configuration
+# Copy to kimo.yaml and adjust for your environment.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# ── CTF platform ──────────────────────────────────────────────────────────────
+platform:
+  # Available: "ctfd"
+  type: ctfd
+  ctfd:
+    url: "https://ctf.example.com"
+    api_key: "YOUR_CTFD_API_KEY"
+
+# ── VM backend ────────────────────────────────────────────────────────────────
+vm:
+  # Available: "firecracker" | "kubevirt"
+  type: firecracker
+
+  firecracker:
+    # Path to the firecracker binary (must be in PATH or absolute).
+    binary_path: "firecracker"
+    # Directory where per-VM API sockets are created.
+    socket_dir: "/run/kimo/vms"
+    # Linux kernel image (uncompressed vmlinux).
+    kernel_image: "/var/lib/kimo/vmlinux"
+    # Base root filesystem image (ext4).
+    rootfs_path: "/var/lib/kimo/ubuntu-22.04.ext4"
+    # CNI network name (optional – leave empty to skip networking setup).
+    cni_network_name: ""
+
+  kubevirt:
+    # Path to a kubeconfig file.  If set, api_server_url and bearer_token are
+    # ignored unless they override values in the kubeconfig.
+    kubeconfig: "/etc/kimo/kubeconfig"
+    # Kubernetes namespace where VirtualMachine CRs are created.
+    namespace: "kimo"
+    # Optional overrides (used when kubeconfig is not provided).
+    api_server_url: ""
+    bearer_token: ""
+
+# ── Proof-of-Work ─────────────────────────────────────────────────────────────
+pow:
+  # Number of leading zero bits required in SHA-256(prefix:nonce).
+  # Difficulty 20 requires ~1 million hash attempts on average.
+  difficulty: 20
+  # How long an issued challenge remains valid.
+  ttl: 5m
