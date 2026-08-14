@@ -1,0 +1,30 @@
+{
+  "name": "kimo (build)",
+
+  "build": {
+    "dockerfile": "../hack/kimo-dev.Dockerfile",
+    "context": ".."
+  },
+
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+
+  "mounts": [
+    "source=kimo-gomod-cache,target=/go/pkg/mod,type=volume",
+    "source=kimo-gobuild-cache,target=/root/.cache/go-build,type=volume"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "go.toolsManagement.autoUpdate": false
+      },
+      "extensions": [
+        "golang.go",
+        "ms-kubernetes-tools.vscode-kubernetes-tools"
+      ]
+    }
+  },
+
+  "postCreateCommand": "go build ./... && go vet ./..."
+}
