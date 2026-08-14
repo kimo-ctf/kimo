@@ -66,6 +66,13 @@ type Backend interface {
 	Authenticate(r *http.Request) (Principal, error)
 }
 
+// WebhookRegistrar is an optional capability a Backend can implement to
+// support runtime webhook registration via the REST API. Only the generic
+// backend implements it today.
+type WebhookRegistrar interface {
+	RegisterWebhook(url, secret string) error
+}
+
 // Factory constructs a Backend from its opaque, backend-specific config.
 type Factory func(cfg json.RawMessage) (Backend, error)
 
