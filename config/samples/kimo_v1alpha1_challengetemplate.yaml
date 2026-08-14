@@ -1,0 +1,9 @@
+apiVersion: kimo.kimo.io/v1alpha1
+kind: ChallengeTemplate
+metadata:
+  labels:
+    app.kubernetes.io/name: workspace
+    app.kubernetes.io/managed-by: kustomize
+  name: challengetemplate-sample
+spec:
+  # TODO(user): Add fields here

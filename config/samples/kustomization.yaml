@@ -1,0 +1,7 @@
+## Append samples of your project ##
+resources:
+- kimo_v1alpha1_challengetemplate.yaml
+- kimo_v1alpha1_challengeinstance.yaml
+- kimo_v1alpha1_challengeset.yaml
+- kimo_v1alpha1_networkfence.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
