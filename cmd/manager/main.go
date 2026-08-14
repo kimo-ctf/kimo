@@ -18,7 +18,9 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
+	"net/http"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -36,7 +38,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+	"github.com/hermannchristopher/kimo/internal/api"
 	"github.com/hermannchristopher/kimo/internal/controller"
+	"github.com/hermannchristopher/kimo/internal/integrations"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -178,6 +182,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	backendName := os.Getenv("KIMO_BACKEND")
+	if backendName == "" {
+		backendName = "generic"
+	}
+	backend, err := integrations.New(backendName, json.RawMessage(os.Getenv("KIMO_BACKEND_CONFIG")))
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize scoring backend", "backend", backendName)
+		os.Exit(1)
+	}
+
 	if err := (&controller.ChallengeTemplateReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -186,8 +200,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ChallengeInstanceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Backend: backend,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "challengeinstance")
 		os.Exit(1)
@@ -207,8 +222,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.LifecycleReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Backend: backend,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "lifecycle")
 		os.Exit(1)
@@ -223,6 +239,15 @@ func main() {
 		setupLog.Error(err, "Failed to set up ready check")
 		os.Exit(1)
 	}
+
+	apiServer := api.NewServer(mgr.GetClient(), backend)
+	go func() {
+		setupLog.Info("Starting API server", "addr", ":8080")
+		if err := http.ListenAndServe(":8080", apiServer.Router()); err != nil {
+			setupLog.Error(err, "API server failed")
+			os.Exit(1)
+		}
+	}()
 
 	setupLog.Info("Starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
