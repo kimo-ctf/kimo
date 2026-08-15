@@ -48,6 +48,15 @@ func TestCTFdBackend_NotifyPostsTranslatedPayload(t *testing.T) {
 
 func TestCTFdBackend_AuthenticateValidatesAgainstCTFd(t *testing.T) {
 	ctfd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Real CTFd only runs its Authorization-header check when the
+		// request looks like JSON (request.is_json) — a request without
+		// this returns a 302 to /login, not a 401. Confirmed live against
+		// a real CTFd instance; asserted here so a regression fails loudly
+		// instead of only showing up against a real server.
+		if r.Header.Get("Content-Type") != "application/json" {
+			w.WriteHeader(http.StatusFound)
+			return
+		}
 		if r.Header.Get("Authorization") != "Token good-token" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return

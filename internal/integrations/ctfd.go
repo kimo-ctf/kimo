@@ -104,6 +104,12 @@ func (b *ctfdBackend) Authenticate(r *http.Request) (Principal, error) {
 		return Principal{}, err
 	}
 	req.Header.Set("Authorization", token)
+	// CTFd's token-auth hook only fires when the request looks like JSON
+	// (request.is_json in its before_request handler) — a GET with no
+	// Content-Type falls through to session auth and just 302s to /login,
+	// not a 401. Confirmed against a real CTFd instance: this header is
+	// not optional, unlike what the httptest-mocked unit test suggested.
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := b.client.Do(req)
 	if err != nil {
