@@ -1,11 +1,20 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
-# Ignore everything by default and re-include only needed files
-**
+#
+# NOTE: an allowlist form of this file (exclude "**", then "!**/*.go" to
+# re-include) does NOT work under Podman/buildah — negating a file whose
+# parent directory was excluded by a wildcard is silently ignored, so the
+# build context ends up empty except for top-level files. Denylist form
+# instead: exclude what we don't want, let everything else (including all
+# source directories) through.
 
-# Re-include Go source files (but not *_test.go)
-!**/*.go
+.git
+.github
+.devcontainer
+bin
+docs
+assets
+hack
+helm
+*.md
+
 **/*_test.go
-
-# Re-include Go module files
-!go.mod
-!go.sum
