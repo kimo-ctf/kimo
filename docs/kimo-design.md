@@ -210,6 +210,7 @@ spec:
 ### Instance Controller
 - Creates Deployment + Service for the instance's container spec
 - Injects per-instance flags
+- Creates a NetworkFence scoped to the instance's exposed ports, denying `kimo-system` and egress by default — this is what gives the Network Controller (below) something to act on; without it no NetworkPolicy would ever get created. Team-scoped ingress (only the assigned team can reach an instance) isn't populated yet — nothing else in the system assigns per-team CIDR ranges, so there's nothing real to put in it today.
 - Watches the owned Pod's status/conditions and drives the phase state machine above (Pending → Creating → Running ↔ Unhealthy → …)
 - Calls `Backend.Notify` on every phase transition
 - Cleanup via OwnerReferences on delete

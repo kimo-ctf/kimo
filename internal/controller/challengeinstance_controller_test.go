@@ -116,6 +116,16 @@ func TestInstanceController_CreatesDeploymentAndService(t *testing.T) {
 		types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &svc))
 	assert.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
 
+	var fence kimov1alpha1.NetworkFence
+	require.NoError(t, client.Get(context.Background(),
+		types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &fence))
+	assert.Equal(t, "web-sqli-team-1", fence.Spec.InstanceRef)
+	require.Len(t, fence.Spec.AllowRules, 1)
+	assert.Equal(t, int32(8080), fence.Spec.AllowRules[0].Port)
+	require.Len(t, fence.Spec.DenyRules, 1)
+	assert.Equal(t, "kimo-system", fence.Spec.DenyRules[0].To)
+	assert.False(t, fence.Spec.AllowEgress)
+
 	var updated kimov1alpha1.ChallengeInstance
 	require.NoError(t, client.Get(context.Background(),
 		types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &updated))

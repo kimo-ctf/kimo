@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -100,6 +101,22 @@ var _ = Describe("ChallengeInstance", func() {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: "default"}, &svc)
 		}).Should(Succeed())
 		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+
+		// Proves the full chain works, not just the Instance Controller in
+		// isolation: it creates a NetworkFence, and the separate NetworkFence
+		// Controller (a real watch + reconcile of its own) turns that into
+		// an actual NetworkPolicy.
+		var fence kimov1alpha1.NetworkFence
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: "default"}, &fence)
+		}).Should(Succeed())
+		Expect(fence.Spec.InstanceRef).To(Equal(instance.Name))
+
+		var np networkingv1.NetworkPolicy
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: "kimo-" + instance.Name, Namespace: "default"}, &np)
+		}).Should(Succeed())
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue("kimo.io/instance", instance.Name))
 
 		// envtest has no kube-controller-manager/kubelet, so the Deployment
 		// never gets a real Pod — Creating (not Running) is as far as this

@@ -87,6 +87,10 @@ func (r *ChallengeInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	if err := r.ensureNetworkFence(ctx, &instance, &tmpl); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.ensureExpiry(&instance, &tmpl); err != nil {
 		return r.transition(ctx, &instance, kimov1alpha1.InstancePhaseFailed, err.Error())
 	}
@@ -136,6 +140,52 @@ func (r *ChallengeInstanceReconciler) ensureWorkload(ctx context.Context, instan
 
 	instance.Status.PodName = dep.Name
 	return nil
+}
+
+// ensureNetworkFence creates the NetworkFence that gives this instance its
+// network isolation (per design: deny by default, only the template's
+// exposed ports reachable, kimo-system unreachable). Without this the
+// NetworkFence Controller has nothing to react to — it only reconciles
+// NetworkFence objects that already exist, it doesn't create them itself.
+//
+// Team-scoped ingress (restricting who can reach an instance to just its
+// own team) isn't wired up here: nothing else in the system assigns
+// per-team CIDR ranges yet, so there's no real value to put in an
+// AllowRule.CIDR. Only port-based ingress and the kimo-system egress deny
+// are populated; team-scoping is a later addition once that exists.
+func (r *ChallengeInstanceReconciler) ensureNetworkFence(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) error {
+	fence := r.buildNetworkFence(instance, tmpl)
+	if err := controllerutil.SetControllerReference(instance, fence, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference: %w", err)
+	}
+	var existing kimov1alpha1.NetworkFence
+	if err := r.Get(ctx, types.NamespacedName{Name: fence.Name, Namespace: fence.Namespace}, &existing); err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		if err := r.Create(ctx, fence); err != nil {
+			return fmt.Errorf("creating network fence: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *ChallengeInstanceReconciler) buildNetworkFence(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) *kimov1alpha1.NetworkFence {
+	var allow []kimov1alpha1.AllowRule
+	for _, p := range tmpl.Spec.Container.Ports {
+		if p.Expose {
+			allow = append(allow, kimov1alpha1.AllowRule{Port: p.ContainerPort})
+		}
+	}
+	return &kimov1alpha1.NetworkFence{
+		ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace},
+		Spec: kimov1alpha1.NetworkFenceSpec{
+			InstanceRef: instance.Name,
+			AllowRules:  allow,
+			DenyRules:   []kimov1alpha1.DenyRule{{To: "kimo-system"}},
+			AllowEgress: false,
+		},
+	}
 }
 
 func (r *ChallengeInstanceReconciler) ensureExpiry(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) error {
