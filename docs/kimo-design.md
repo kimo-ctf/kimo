@@ -1,21 +1,23 @@
 # KIMO Design Document
 
-**Date**: 2026-04-10
-**Status**: Approved
+**Date**: 2026-08-12
+**Status**: Approved (revision 2)
+
+**Revision 2 changes:** dropped VM/KubeVirt runtime support — KIMO is container-only now. Replaced the flat "generic webhook" integration with a pluggable `ScoringBackend` adapter architecture, and deepened the container instance lifecycle model (explicit phases driven by real Pod health, not just TTL bookkeeping).
 
 ## Overview
 
-KIMO (Kubernetes Instance Manager Operator) is a Go-based Kubernetes operator that deploys and manages CTF challenge instances on containers and VMs. It provides on-demand provisioning, automatic TTL-based cleanup, built-in network isolation, a REST API for scoring platform integration, PoW-based abuse prevention, and a Discord bot for organizer management.
+KIMO (Kubernetes Instance Manager Operator) is a Go-based Kubernetes operator that deploys and manages CTF challenge instances as containers. It provides on-demand provisioning, a real container lifecycle state machine driven by Pod health, automatic TTL-based cleanup, built-in network isolation, PoW-based abuse prevention, a pluggable backend layer for integrating with any scoring platform, and a Discord bot for organizer management.
 
 ## Requirements
 
-- **Runtime**: Containers (Pods/Deployments) and VMs (KubeVirt)
+- **Runtime**: Containers only (Pods/Deployments)
 - **Isolation**: Configurable per challenge (shared / per-team / per-player)
 - **Language**: Go with kubebuilder/controller-runtime
-- **Integration**: Generic REST API + webhooks for any scoring platform
+- **Integration**: Pluggable scoring-platform backends — a built-in generic REST+webhook backend that works out of the box, plus first-class adapters for common platforms and a documented interface for adding new ones
 - **Scale**: 500+ concurrent instances
 - **Networking**: Built-in NetworkPolicy management
-- **Lifecycle**: On-demand provisioning + configurable TTL auto-cleanup
+- **Lifecycle**: On-demand provisioning, a real health-driven state machine, and configurable TTL auto-cleanup
 - **PoW**: Proof of Work to prevent instance provisioning abuse
 - **Discord**: Bot for challenge management and monitoring
 
@@ -26,6 +28,8 @@ Single operator binary with multiple controllers, plus a separate Discord bot bi
 ```
                     +-----------------+
                     |  Scoring Platform|
+                    | (CTFd / rCTF /   |
+                    |  custom / ...)   |
                     +--------+--------+
                              |
                     REST API (Bearer auth)
@@ -42,13 +46,27 @@ Single operator binary with multiple controllers, plus a separate Discord bot bi
 +--------v------+  +---------v------+  +---------v------+
 | Instance      |  | Network        |  | Lifecycle      |
 | Controller    |  | Controller     |  | Controller     |
-+-------+-------+  +-------+--------+  +----------------+
-        |                   |
-   +----+----+         +----+----+
-   |         |         |         |
- Pods    KubeVirt   NetPol    Ingress
-         VMIs
+| (Pod health   |  |                |  | (TTL + expiry) |
+|  state machine)|  |                |  |                |
++-------+-------+  +-------+--------+  +-------+--------+
+        |                   |                   |
+      Pods            NetPol / Ingress    lifecycle events
+        |                                        |
+        +----------------------------------------+
+                             |
+                    +--------v--------+
+                    | Backend Registry|
+                    +--------+--------+
+                             |
+              +--------------+--------------+
+              |              |              |
+        +-----v----+   +-----v----+   +-----v----+
+        | generic  |   |  ctfd    |   |  rctf    |   ...custom
+        | (webhook)|   |          |   |          |
+        +----------+   +----------+   +----------+
 ```
+
+Instance and Lifecycle controllers emit lifecycle events (phase transitions) into the **Backend Registry**, which fans them out to whichever `ScoringBackend` adapter is configured for the deployment. This is the single integration seam — every scoring platform integration goes through it, including the built-in generic REST/webhook mode.
 
 ## Custom Resource Definitions
 
@@ -56,7 +74,7 @@ API group: `kimo.io/v1alpha1`
 
 ### ChallengeTemplate
 
-Blueprint for a challenge, created by challenge authors.
+Blueprint for a challenge, created by challenge authors. Containers only — there is no runtime switch.
 
 ```yaml
 apiVersion: kimo.io/v1alpha1
@@ -70,7 +88,6 @@ spec:
   flagSecretRef:
     name: web-sqli-101-flag
   instanceMode: perTeam       # shared | perTeam | perPlayer
-  runtime: container          # container | vm
   ttl: 30m
   maxInstances: 200
   pow:
@@ -91,7 +108,12 @@ spec:
       - name: FLAG
         valueFrom:
           secretKeyRef: { name: web-sqli-101-flag, key: flag }
-  # vm: { ... }              # KubeVirt VMI spec when runtime=vm
+    readiness:                 # optional; drives Pending -> Running transition
+      type: tcp                # tcp | http | none (defaults to tcp on first exposed port)
+      port: 8080
+      path: /healthz           # only for type: http
+    restartPolicy: OnFailure    # OnFailure | Always | Never — maps to Pod restartPolicy
+    unhealthyThreshold: 3       # consecutive failed readiness checks before phase -> Unhealthy
 status:
   ready: true
   instanceCount: 42
@@ -99,7 +121,7 @@ status:
 
 ### ChallengeInstance
 
-A running instance of a challenge.
+A running instance of a challenge. The status phase now reflects real Pod health, not just bookkeeping.
 
 ```yaml
 apiVersion: kimo.io/v1alpha1
@@ -115,12 +137,32 @@ spec:
   player: ""
   ttlOverride: 45m
 status:
-  phase: Running              # Pending | Running | Expired | Failed
+  phase: Running               # Pending | Creating | Running | Unhealthy | Expiring | Expired | Terminating | Failed
+  reason: ""                   # short machine-readable reason for the current phase
   endpoint: "https://web-sqli-101-team-42.ctf.example.com"
-  startedAt: "2026-04-10T14:00:00Z"
-  expiresAt: "2026-04-10T14:45:00Z"
+  startedAt: "2026-08-12T14:00:00Z"
+  expiresAt: "2026-08-12T14:45:00Z"
   podName: web-sqli-101-team-42-xyz
 ```
+
+**Phase state machine:**
+
+```
+Pending --> Creating --> Running <--> Unhealthy --> Expiring --> Expired --> Terminating
+   |            |            |             |
+   +----------- +----------- +-------------+--> Failed (terminal, unrecoverable)
+```
+
+- **Pending**: CR accepted, waiting on template readiness or capacity (`maxInstances`).
+- **Creating**: Deployment/Service objects created, waiting for the Pod to exist and pass its first readiness check.
+- **Running**: Pod passes readiness. Instance Controller watches the owned Pod continuously.
+- **Unhealthy**: Pod exists but has failed readiness `unhealthyThreshold` times in a row, or is crash-looping. Instance stays reachable in the CR but the phase signals degraded state to the backend and the scoring platform.
+- **Expiring**: within a short grace window of `expiresAt` (default 60s) — gives the backend a chance to notify players before teardown.
+- **Expired**: `expiresAt` has passed; Lifecycle Controller has marked it for deletion.
+- **Terminating**: owned resources are being deleted.
+- **Failed**: unrecoverable error (bad template, invalid TTL, image pull failure past a retry budget). Terminal — requires operator/organizer intervention.
+
+Every transition triggers a `Notify` call into the Backend Registry (see below).
 
 ### ChallengeSet
 
@@ -134,8 +176,8 @@ spec:
     - web-sqli-101
     - web-xss-201
   schedule:
-    startAt: "2026-04-10T10:00:00Z"
-    endAt: "2026-04-10T18:00:00Z"
+    startAt: "2026-08-12T10:00:00Z"
+    endAt: "2026-08-12T18:00:00Z"
 ```
 
 ### NetworkFence
@@ -157,16 +199,15 @@ spec:
 ## Controllers
 
 ### Template Controller
-- Validates ChallengeTemplate specs (image, resources, flag secret)
+- Validates ChallengeTemplate specs (image, resources, flag secret, container spec required)
 - Sets `status.ready` and tracks `status.instanceCount`
 - Enforces `maxInstances` cap
 
 ### Instance Controller
-- Creates workloads based on `runtime`:
-  - Container: Deployment + Service
-  - VM: KubeVirt VirtualMachineInstance + Service
+- Creates Deployment + Service for the instance's container spec
 - Injects per-instance flags
-- Updates status (phase, endpoint, timestamps)
+- Watches the owned Pod's status/conditions and drives the phase state machine above (Pending → Creating → Running ↔ Unhealthy → …)
+- Calls `Backend.Notify` on every phase transition
 - Cleanup via OwnerReferences on delete
 
 ### Network Controller
@@ -180,17 +221,120 @@ spec:
 
 ### Lifecycle Controller
 - Periodic reconciliation (30s interval)
-- Expires instances where `expiresAt < now`
+- Moves instances into `Expiring` within the grace window, then `Expired` where `expiresAt < now`
 - Handles TTL extensions
-- Grace period before deletion
+- Grace period before deletion; hands off to Instance Controller's `Terminating` cleanup
 
 ### Set Controller
 - Manages bulk start/stop of challenge groups
 - Enforces schedule windows
 
+## Scoring Backend Integrations
+
+This is the primary extension point for connecting KIMO to a scoring platform. Every integration — including the default one — implements the same interface, so adding support for a new platform never touches the controllers.
+
+### The `Backend` interface
+
+```go
+package integrations
+
+type EventType string
+
+const (
+    EventCreating  EventType = "instance.creating"
+    EventRunning   EventType = "instance.running"
+    EventUnhealthy EventType = "instance.unhealthy"
+    EventExpiring  EventType = "instance.expiring"
+    EventExpired   EventType = "instance.expired"
+    EventFailed    EventType = "instance.failed"
+    EventDeleted   EventType = "instance.deleted"
+)
+
+type Event struct {
+    Type      EventType
+    Instance  string
+    Challenge string
+    Team      string
+    Player    string
+    Endpoint  string
+    Reason    string
+    Timestamp time.Time
+}
+
+// Principal identifies the caller of a KIMO API request, as resolved by
+// the active backend's own auth scheme (API key, JWT, HMAC, ...).
+type Principal struct {
+    Subject string
+    Team    string
+    Scopes  []string
+}
+
+// Backend is implemented by every scoring-platform integration.
+type Backend interface {
+    Name() string
+    // Notify is called on every ChallengeInstance phase transition.
+    Notify(ctx context.Context, event Event) error
+    // Authenticate resolves the caller of an inbound KIMO API request.
+    Authenticate(r *http.Request) (Principal, error)
+}
+```
+
+### Registry
+
+Backends self-register at init time; the manager picks exactly one active backend from config at startup.
+
+```go
+package integrations
+
+var registry = map[string]func(cfg json.RawMessage) (Backend, error){}
+
+func Register(name string, factory func(cfg json.RawMessage) (Backend, error)) {
+    registry[name] = factory
+}
+
+func New(name string, cfg json.RawMessage) (Backend, error) {
+    factory, ok := registry[name]
+    if !ok {
+        return nil, fmt.Errorf("unknown scoring backend %q", name)
+    }
+    return factory(cfg)
+}
+```
+
+### Built-in adapters
+
+| Backend | Notify behavior | Authenticate behavior |
+|---|---|---|
+| `generic` (default) | HMAC-SHA256-signed webhook POSTs to one or more registered URLs (today's design, kept as the zero-config fallback) | Static Bearer API key |
+| `ctfd` | Translates events into CTFd's webhook payload shape, posts to CTFd's configured endpoint | Validates CTFd API tokens against CTFd's `/api/v1/users/me` |
+| `rctf` | Translates events into rCTF's event format | Validates rCTF JWTs |
+
+`generic` requires zero backend-specific code from an operator — it's the same REST API + HMAC webhook mechanism as before, just expressed as one adapter implementation instead of being baked into the API server.
+
+### Adding a new backend
+
+1. Implement the `Backend` interface in a new file under `internal/integrations/` (typically ~50-100 lines: a `Notify` translator and an `Authenticate` call to the platform's auth endpoint).
+2. Register it in an `init()`: `integrations.Register("myplatform", NewMyPlatformBackend)`.
+3. Select it via Helm values (`integration.backend: myplatform`) and supply its config.
+
+No dynamic plugin loading (Go plugins aren't portable across platforms/build configs) — new backends are compiled in via a PR to `internal/integrations/`, same as any other Go package. This keeps the extension point simple and testable instead of promising a plugin system KIMO can't reliably support.
+
+### Configuration
+
+```yaml
+# Helm values.yaml
+integration:
+  backend: ctfd          # generic | ctfd | rctf | <custom, once registered>
+  config:                # backend-specific, passed through as opaque JSON
+    baseUrl: https://ctf.example.com
+    apiKeySecretRef: ctfd-api-key
+```
+
+Loaded once at manager startup; the resolved `Backend` is injected into the REST API server (for `Authenticate`) and into the Instance/Lifecycle controllers (for `Notify`).
+
 ## REST API
 
-Deployed as a Service in `kimo-system`, authenticated via API key (`Bearer` token).
+Deployed as a Service in `kimo-system`. Auth is delegated to the active backend's `Authenticate`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -202,25 +346,8 @@ Deployed as a Service in `kimo-system`, authenticated via API key (`Bearer` toke
 | `GET` | `/api/v1/templates` | List available templates |
 | `GET` | `/api/v1/templates/{name}` | Get template details |
 | `GET` | `/api/v1/pow/challenge` | Get PoW puzzle |
-| `POST` | `/api/v1/webhooks/configure` | Register webhook URL |
+| `POST` | `/api/v1/webhooks/configure` | Register a webhook URL (generic backend only) |
 | `GET` | `/api/v1/health` | Health check |
-
-### Webhook Callbacks
-
-Events: `instance.pending`, `instance.running`, `instance.expired`, `instance.failed`, `instance.deleted`
-
-```json
-{
-  "event": "instance.running",
-  "instance": "web-sqli-101-team-42",
-  "challenge": "web-sqli-101",
-  "team": "team-42",
-  "endpoint": "https://web-sqli-101-team-42.ctf.example.com",
-  "timestamp": "2026-04-10T14:00:05Z"
-}
-```
-
-Webhook signatures verified via HMAC-SHA256.
 
 ## Proof of Work
 
@@ -231,11 +358,11 @@ Configurable per ChallengeTemplate. Enforced by the API server before provisioni
 3. Client solves locally, submits nonce with provisioning request
 4. Server verifies before creating ChallengeInstance CR
 
-Difficulty tunable per challenge (harder for expensive VMs, easier for containers).
+Difficulty tunable per challenge.
 
 ## Discord Bot
 
-Separate binary (`cmd/bot/`), deployed alongside the operator. Communicates via KIMO REST API.
+Separate binary (`cmd/bot/`), deployed alongside the operator. Communicates via KIMO REST API — it never talks to a scoring backend directly, so it's unaffected by which `ScoringBackend` adapter is active.
 
 ### Commands
 
@@ -253,7 +380,7 @@ Separate binary (`cmd/bot/`), deployed alongside the operator. Communicates via 
 
 ### Event Streaming
 
-Registers as a KIMO webhook consumer. Posts formatted embeds to monitoring channels on instance status changes.
+Registers as a `generic`-backend webhook consumer when that backend is active. Posts formatted embeds to monitoring channels on instance status changes. (When a non-generic backend is active, event streaming comes from that platform's own webhooks if it has them — the bot's `/monitor` commands document this per-backend.)
 
 ### RBAC
 
@@ -292,10 +419,15 @@ kimo/
 ├── internal/
 │   ├── controller/
 │   │   ├── template_controller.go
-│   │   ├── instance_controller.go
+│   │   ├── instance_controller.go    # container lifecycle state machine
 │   │   ├── network_controller.go
 │   │   ├── lifecycle_controller.go
 │   │   └── set_controller.go
+│   ├── integrations/                 # pluggable scoring backend adapters
+│   │   ├── backend.go                # interface + registry
+│   │   ├── generic.go                # default HMAC-webhook adapter
+│   │   ├── ctfd.go
+│   │   └── rctf.go
 │   ├── api/
 │   │   ├── server.go
 │   │   ├── handlers.go
@@ -323,8 +455,9 @@ kimo/
 
 ## Testing Strategy
 
-- **Unit**: Controller reconciliation with fake clients
+- **Unit**: Controller reconciliation with fake clients, including the Pod-health-driven phase transitions
 - **Integration**: CRD lifecycle with envtest
 - **E2E**: Full operator in kind cluster
 - **API**: REST handlers with httptest, PoW verification
+- **Backends**: each adapter unit-tested against recorded fixtures of its platform's expected payload/auth shape
 - **CI**: GitHub Actions (lint, unit, integration, e2e)

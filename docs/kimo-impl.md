@@ -2,11 +2,13 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers-extended-cc:executing-plans to implement this plan task-by-task.
 
-**Goal:** Build a Kubernetes operator that deploys and manages CTF challenge instances on containers and VMs, with a REST API, PoW protection, and Discord bot.
+**Goal:** Build a Kubernetes operator that deploys and manages CTF challenge instances as containers, with a health-driven lifecycle state machine, a REST API, PoW protection, a pluggable scoring-backend integration layer, and a Discord bot.
 
-**Architecture:** Single Go operator binary (kubebuilder) with 5 controllers (Template, Instance, Network, Lifecycle, Set), a REST API server embedded in the manager, and a separate Discord bot binary. All deployed via Helm.
+**Architecture:** Single Go operator binary (kubebuilder) with 5 controllers (Template, Instance, Network, Lifecycle, Set), a REST API server embedded in the manager, a pluggable `Backend` integration layer (`internal/integrations/`) with a generic webhook adapter and platform-specific adapters (CTFd shown as the worked example), and a separate Discord bot binary. All deployed via Helm.
 
-**Tech Stack:** Go 1.22+, kubebuilder v4, controller-runtime, KubeVirt client-go, chi (HTTP router), discordgo, envtest, kind
+**Revision note:** this plan supersedes the original version, which included a KubeVirt VM runtime and a single hard-coded generic-webhook integration. VM support is dropped entirely — KIMO is container-only. Integration is now a proper plugin seam (`Backend` interface + registry) instead of code baked into the API server, and the Instance Controller drives a real Pod-health state machine instead of only tracking TTLs.
+
+**Tech Stack:** Go 1.22+, kubebuilder v4, controller-runtime, chi (HTTP router), discordgo, envtest, kind
 
 ---
 
@@ -72,6 +74,8 @@ kubebuilder create api --group kimo --version v1alpha1 --kind ChallengeTemplate 
 
 **Step 2: Define ChallengeTemplate spec and status types**
 
+Containers are the only runtime — there is no runtime switch and no VM spec. `ContainerSpec` gains the fields that drive the Instance Controller's lifecycle state machine: `Readiness`, `RestartPolicy`, `UnhealthyThreshold`.
+
 Edit `api/v1alpha1/challengetemplate_types.go`:
 
 ```go
@@ -91,15 +95,6 @@ const (
         InstanceModeShared    InstanceMode = "shared"
         InstanceModePerTeam   InstanceMode = "perTeam"
         InstanceModePerPlayer InstanceMode = "perPlayer"
-)
-
-// RuntimeType defines the workload runtime.
-// +kubebuilder:validation:Enum=container;vm
-type RuntimeType string
-
-const (
-        RuntimeContainer RuntimeType = "container"
-        RuntimeVM        RuntimeType = "vm"
 )
 
 // PoWSpec configures Proof of Work for a challenge.
@@ -123,35 +118,56 @@ type ResourceRequirements struct {
         Limits   map[corev1.ResourceName]resource.Quantity `json:"limits,omitempty"`
 }
 
-// ContainerSpec defines the container runtime configuration.
-type ContainerSpec struct {
-        Image     string                `json:"image"`
-        Ports     []ContainerPort       `json:"ports,omitempty"`
-        Resources ResourceRequirements  `json:"resources,omitempty"`
-        Env       []corev1.EnvVar       `json:"env,omitempty"`
+// ReadinessType selects how the Instance Controller checks container readiness.
+// +kubebuilder:validation:Enum=tcp;http;none
+type ReadinessType string
+
+const (
+        ReadinessTCP  ReadinessType = "tcp"
+        ReadinessHTTP ReadinessType = "http"
+        ReadinessNone ReadinessType = "none"
+)
+
+// ReadinessCheck configures the Pending/Creating -> Running transition.
+// Defaults to a TCP check on the first exposed port when omitted.
+type ReadinessCheck struct {
+        Type ReadinessType `json:"type,omitempty"`
+        Port int32         `json:"port,omitempty"`
+        Path string        `json:"path,omitempty"` // http only
 }
 
-// VMSpec defines the KubeVirt VM runtime configuration.
-type VMSpec struct {
-        Image     string               `json:"image,omitempty"`     // VM disk image
-        CPUs      int32                `json:"cpus,omitempty"`
-        Memory    resource.Quantity    `json:"memory,omitempty"`
-        DiskSize  resource.Quantity    `json:"diskSize,omitempty"`
+// RestartPolicy mirrors a subset of corev1.RestartPolicy.
+// +kubebuilder:validation:Enum=OnFailure;Always;Never
+type RestartPolicy string
+
+const (
+        RestartOnFailure RestartPolicy = "OnFailure"
+        RestartAlways    RestartPolicy = "Always"
+        RestartNever     RestartPolicy = "Never"
+)
+
+// ContainerSpec defines the container runtime configuration.
+type ContainerSpec struct {
+        Image              string               `json:"image"`
+        Ports              []ContainerPort      `json:"ports,omitempty"`
+        Resources          ResourceRequirements `json:"resources,omitempty"`
+        Env                []corev1.EnvVar      `json:"env,omitempty"`
+        Readiness          *ReadinessCheck      `json:"readiness,omitempty"`
+        RestartPolicy      RestartPolicy        `json:"restartPolicy,omitempty"`      // default OnFailure
+        UnhealthyThreshold int32                `json:"unhealthyThreshold,omitempty"` // default 3
 }
 
 // ChallengeTemplateSpec defines the desired state of ChallengeTemplate.
 type ChallengeTemplateSpec struct {
-        Category      string              `json:"category,omitempty"`
-        Difficulty    string              `json:"difficulty,omitempty"`
-        Points        int                 `json:"points,omitempty"`
+        Category      string                      `json:"category,omitempty"`
+        Difficulty    string                      `json:"difficulty,omitempty"`
+        Points        int                         `json:"points,omitempty"`
         FlagSecretRef corev1.LocalObjectReference `json:"flagSecretRef"`
-        InstanceMode  InstanceMode        `json:"instanceMode"`
-        Runtime       RuntimeType         `json:"runtime"`
-        TTL           string              `json:"ttl"`                  // e.g. "30m"
-        MaxInstances  int                 `json:"maxInstances"`
-        PoW           *PoWSpec            `json:"pow,omitempty"`
-        Container     *ContainerSpec      `json:"container,omitempty"`  // when runtime=container
-        VM            *VMSpec             `json:"vm,omitempty"`         // when runtime=vm
+        InstanceMode  InstanceMode                `json:"instanceMode"`
+        TTL           string                      `json:"ttl"` // e.g. "30m"
+        MaxInstances  int                         `json:"maxInstances"`
+        PoW           *PoWSpec                    `json:"pow,omitempty"`
+        Container     ContainerSpec               `json:"container"`
 }
 
 // ChallengeTemplateStatus defines the observed state.
@@ -163,7 +179,6 @@ type ChallengeTemplateStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Runtime",type=string,JSONPath=`.spec.runtime`
 // +kubebuilder:printcolumn:name="Mode",type=string,JSONPath=`.spec.instanceMode`
 // +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`
 // +kubebuilder:printcolumn:name="Instances",type=integer,JSONPath=`.status.instanceCount`
@@ -223,6 +238,8 @@ kubebuilder create api --group kimo --version v1alpha1 --kind ChallengeInstance 
 
 **Step 2: Define ChallengeInstance types**
 
+The phase enum now models real container health, not just TTL bookkeeping: `Pending -> Creating -> Running <-> Unhealthy -> Expiring -> Expired -> Terminating`, with `Failed` reachable from any non-terminal phase.
+
 Edit `api/v1alpha1/challengeinstance_types.go`:
 
 ```go
@@ -233,14 +250,18 @@ import (
 )
 
 // InstancePhase represents the lifecycle phase of an instance.
-// +kubebuilder:validation:Enum=Pending;Running;Expired;Failed
+// +kubebuilder:validation:Enum=Pending;Creating;Running;Unhealthy;Expiring;Expired;Terminating;Failed
 type InstancePhase string
 
 const (
-        InstancePhasePending InstancePhase = "Pending"
-        InstancePhaseRunning InstancePhase = "Running"
-        InstancePhaseExpired InstancePhase = "Expired"
-        InstancePhaseFailed  InstancePhase = "Failed"
+        InstancePhasePending     InstancePhase = "Pending"
+        InstancePhaseCreating    InstancePhase = "Creating"
+        InstancePhaseRunning     InstancePhase = "Running"
+        InstancePhaseUnhealthy   InstancePhase = "Unhealthy"
+        InstancePhaseExpiring    InstancePhase = "Expiring"
+        InstancePhaseExpired     InstancePhase = "Expired"
+        InstancePhaseTerminating InstancePhase = "Terminating"
+        InstancePhaseFailed      InstancePhase = "Failed"
 )
 
 // ChallengeInstanceSpec defines the desired state.
@@ -253,13 +274,14 @@ type ChallengeInstanceSpec struct {
 
 // ChallengeInstanceStatus defines the observed state.
 type ChallengeInstanceStatus struct {
-        Phase     InstancePhase  `json:"phase,omitempty"`
-        Endpoint  string         `json:"endpoint,omitempty"`
-        StartedAt *metav1.Time   `json:"startedAt,omitempty"`
-        ExpiresAt *metav1.Time   `json:"expiresAt,omitempty"`
-        PodName   string         `json:"podName,omitempty"`
-        VMName    string         `json:"vmName,omitempty"`
-        Message   string         `json:"message,omitempty"`
+        Phase          InstancePhase `json:"phase,omitempty"`
+        Reason         string        `json:"reason,omitempty"`
+        Endpoint       string        `json:"endpoint,omitempty"`
+        StartedAt      *metav1.Time  `json:"startedAt,omitempty"`
+        ExpiresAt      *metav1.Time  `json:"expiresAt,omitempty"`
+        PodName        string        `json:"podName,omitempty"`
+        UnhealthyCount int32         `json:"unhealthyCount,omitempty"` // consecutive failed readiness checks
+        Message        string        `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -333,7 +355,7 @@ type ScheduleSpec struct {
 }
 
 type ChallengeSetSpec struct {
-        Challenges []string     `json:"challenges"`
+        Challenges []string      `json:"challenges"`
         Schedule   *ScheduleSpec `json:"schedule,omitempty"`
 }
 
@@ -385,10 +407,10 @@ type DenyRule struct {
 }
 
 type NetworkFenceSpec struct {
-        InstanceRef  string      `json:"instanceRef"`
-        AllowRules   []AllowRule `json:"allow,omitempty"`
-        DenyRules    []DenyRule  `json:"deny,omitempty"`
-        AllowEgress  bool        `json:"allowEgress,omitempty"` // allow internet
+        InstanceRef string      `json:"instanceRef"`
+        AllowRules  []AllowRule `json:"allow,omitempty"`
+        DenyRules   []DenyRule  `json:"deny,omitempty"`
+        AllowEgress bool        `json:"allowEgress,omitempty"` // allow internet
 }
 
 type NetworkFenceStatus struct {
@@ -478,10 +500,9 @@ func TestTemplateController_ReconcileValid(t *testing.T) {
                 Spec: kimov1alpha1.ChallengeTemplateSpec{
                         FlagSecretRef: corev1.LocalObjectReference{Name: "flag-secret"},
                         InstanceMode:  kimov1alpha1.InstanceModePerTeam,
-                        Runtime:       kimov1alpha1.RuntimeContainer,
                         TTL:           "30m",
                         MaxInstances:  100,
-                        Container: &kimov1alpha1.ContainerSpec{
+                        Container: kimov1alpha1.ContainerSpec{
                                 Image: "test:latest",
                         },
                 },
@@ -516,10 +537,9 @@ func TestTemplateController_MissingSecret(t *testing.T) {
                 Spec: kimov1alpha1.ChallengeTemplateSpec{
                         FlagSecretRef: corev1.LocalObjectReference{Name: "missing-secret"},
                         InstanceMode:  kimov1alpha1.InstanceModePerTeam,
-                        Runtime:       kimov1alpha1.RuntimeContainer,
                         TTL:           "30m",
                         MaxInstances:  100,
-                        Container:     &kimov1alpha1.ContainerSpec{Image: "test:latest"},
+                        Container:     kimov1alpha1.ContainerSpec{Image: "test:latest"},
                 },
         }
 
@@ -542,7 +562,7 @@ func TestTemplateController_MissingSecret(t *testing.T) {
         assert.Contains(t, updated.Status.Message, "flag secret")
 }
 
-func TestTemplateController_MissingContainerSpec(t *testing.T) {
+func TestTemplateController_MissingImage(t *testing.T) {
         scheme := runtime.NewScheme()
         require.NoError(t, kimov1alpha1.AddToScheme(scheme))
         require.NoError(t, corev1.AddToScheme(scheme))
@@ -557,10 +577,9 @@ func TestTemplateController_MissingContainerSpec(t *testing.T) {
                 Spec: kimov1alpha1.ChallengeTemplateSpec{
                         FlagSecretRef: corev1.LocalObjectReference{Name: "flag-secret"},
                         InstanceMode:  kimov1alpha1.InstanceModePerTeam,
-                        Runtime:       kimov1alpha1.RuntimeContainer,
                         TTL:           "30m",
                         MaxInstances:  100,
-                        // Container is nil — should fail validation
+                        // Container.Image left empty — should fail validation
                 },
         }
 
@@ -578,7 +597,7 @@ func TestTemplateController_MissingContainerSpec(t *testing.T) {
         require.NoError(t, client.Get(context.Background(),
                 types.NamespacedName{Name: "test-challenge", Namespace: "default"}, &updated))
         assert.False(t, updated.Status.Ready)
-        assert.Contains(t, updated.Status.Message, "container spec")
+        assert.Contains(t, updated.Status.Message, "image")
 }
 ```
 
@@ -645,19 +664,9 @@ func (r *ChallengeTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Re
                 return ctrl.Result{}, err
         }
 
-        // Validate runtime spec
-        switch tmpl.Spec.Runtime {
-        case kimov1alpha1.RuntimeContainer:
-                if tmpl.Spec.Container == nil {
-                        return r.setStatus(ctx, &tmpl, false, "container spec required when runtime=container")
-                }
-                if tmpl.Spec.Container.Image == "" {
-                        return r.setStatus(ctx, &tmpl, false, "container image is required")
-                }
-        case kimov1alpha1.RuntimeVM:
-                if tmpl.Spec.VM == nil {
-                        return r.setStatus(ctx, &tmpl, false, "vm spec required when runtime=vm")
-                }
+        // Validate container spec
+        if tmpl.Spec.Container.Image == "" {
+                return r.setStatus(ctx, &tmpl, false, "container image is required")
         }
 
         // Count existing instances
@@ -713,11 +722,13 @@ git commit -m "feat: implement Template Controller with validation"
 
 ---
 
-### Task 5: Instance Controller — Container Runtime
+### Task 5: Instance Controller — Container Lifecycle
 
 **Files:**
 - Modify: `internal/controller/challengeinstance_controller.go`
 - Create: `internal/controller/challengeinstance_controller_test.go`
+
+This is the controller that owns the container lifecycle state machine described in the design doc. It creates the Deployment/Service, then watches the owned Pod's status to drive `Pending -> Creating -> Running <-> Unhealthy`. It depends on `internal/integrations.Backend` (Task 6) to notify the active scoring backend on every transition — define the reconciler with a `Backend` field now and wire a no-op test double until Task 6 lands.
 
 **Step 1: Write the failing test**
 
@@ -731,6 +742,7 @@ import (
         "testing"
 
         kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+        "github.com/hermannchristopher/kimo/internal/integrations"
         "github.com/stretchr/testify/assert"
         "github.com/stretchr/testify/require"
         appsv1 "k8s.io/api/apps/v1"
@@ -751,28 +763,42 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
         return s
 }
 
-func TestInstanceController_CreatesDeploymentAndService(t *testing.T) {
-        scheme := newTestScheme(t)
+// recordingBackend is a test double that records every Notify call.
+type recordingBackend struct {
+        events []integrations.Event
+}
 
-        tmpl := &kimov1alpha1.ChallengeTemplate{
+func (b *recordingBackend) Name() string { return "recording" }
+func (b *recordingBackend) Notify(_ context.Context, e integrations.Event) error {
+        b.events = append(b.events, e)
+        return nil
+}
+func (b *recordingBackend) Authenticate(_ *http.Request) (integrations.Principal, error) {
+        return integrations.Principal{}, nil
+}
+
+func newTemplate() *kimov1alpha1.ChallengeTemplate {
+        return &kimov1alpha1.ChallengeTemplate{
                 ObjectMeta: metav1.ObjectMeta{Name: "web-sqli", Namespace: "default"},
                 Spec: kimov1alpha1.ChallengeTemplateSpec{
                         FlagSecretRef: corev1.LocalObjectReference{Name: "flag"},
                         InstanceMode:  kimov1alpha1.InstanceModePerTeam,
-                        Runtime:       kimov1alpha1.RuntimeContainer,
                         TTL:           "30m",
                         MaxInstances:  100,
-                        Container: &kimov1alpha1.ContainerSpec{
+                        Container: kimov1alpha1.ContainerSpec{
                                 Image: "ctf/web-sqli:v1",
                                 Ports: []kimov1alpha1.ContainerPort{
                                         {Name: "http", ContainerPort: 8080, Expose: true},
                                 },
+                                UnhealthyThreshold: 3,
                         },
                 },
                 Status: kimov1alpha1.ChallengeTemplateStatus{Ready: true},
         }
+}
 
-        instance := &kimov1alpha1.ChallengeInstance{
+func newInstance() *kimov1alpha1.ChallengeInstance {
+        return &kimov1alpha1.ChallengeInstance{
                 ObjectMeta: metav1.ObjectMeta{
                         Name: "web-sqli-team-1", Namespace: "default",
                         Labels: map[string]string{"kimo.io/challenge": "web-sqli", "kimo.io/team": "team-1"},
@@ -782,38 +808,121 @@ func TestInstanceController_CreatesDeploymentAndService(t *testing.T) {
                         Team:        "team-1",
                 },
         }
+}
+
+func TestInstanceController_CreatesDeploymentAndService(t *testing.T) {
+        scheme := newTestScheme(t)
+        tmpl, instance := newTemplate(), newInstance()
 
         client := fake.NewClientBuilder().WithScheme(scheme).
                 WithObjects(tmpl, instance).
                 WithStatusSubresource(instance).
                 Build()
 
-        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme}
+        backend := &recordingBackend{}
+        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme, Backend: backend}
         _, err := r.Reconcile(context.Background(), reconcile.Request{
                 NamespacedName: types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"},
         })
         require.NoError(t, err)
 
-        // Verify Deployment created
         var dep appsv1.Deployment
-        err = client.Get(context.Background(),
-                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &dep)
-        require.NoError(t, err)
+        require.NoError(t, client.Get(context.Background(),
+                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &dep))
         assert.Equal(t, "ctf/web-sqli:v1", dep.Spec.Template.Spec.Containers[0].Image)
 
-        // Verify Service created
         var svc corev1.Service
-        err = client.Get(context.Background(),
-                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &svc)
-        require.NoError(t, err)
+        require.NoError(t, client.Get(context.Background(),
+                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &svc))
         assert.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
 
-        // Verify status updated
         var updated kimov1alpha1.ChallengeInstance
         require.NoError(t, client.Get(context.Background(),
                 types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &updated))
-        assert.Equal(t, kimov1alpha1.InstancePhasePending, updated.Status.Phase)
+        assert.Equal(t, kimov1alpha1.InstancePhaseCreating, updated.Status.Phase)
         assert.NotNil(t, updated.Status.ExpiresAt)
+
+        require.Len(t, backend.events, 1)
+        assert.Equal(t, integrations.EventCreating, backend.events[0].Type)
+}
+
+func TestInstanceController_PodReadyTransitionsToRunning(t *testing.T) {
+        scheme := newTestScheme(t)
+        tmpl, instance := newTemplate(), newInstance()
+        instance.Status.Phase = kimov1alpha1.InstancePhaseCreating
+
+        pod := &corev1.Pod{
+                ObjectMeta: metav1.ObjectMeta{
+                        Name: "web-sqli-team-1-abcde", Namespace: "default",
+                        Labels: map[string]string{"kimo.io/instance": "web-sqli-team-1"},
+                },
+                Status: corev1.PodStatus{
+                        Phase: corev1.PodRunning,
+                        Conditions: []corev1.PodCondition{
+                                {Type: corev1.PodReady, Status: corev1.ConditionTrue},
+                        },
+                },
+        }
+
+        client := fake.NewClientBuilder().WithScheme(scheme).
+                WithObjects(tmpl, instance, pod).
+                WithStatusSubresource(instance).
+                Build()
+
+        backend := &recordingBackend{}
+        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme, Backend: backend}
+        _, err := r.Reconcile(context.Background(), reconcile.Request{
+                NamespacedName: types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"},
+        })
+        require.NoError(t, err)
+
+        var updated kimov1alpha1.ChallengeInstance
+        require.NoError(t, client.Get(context.Background(),
+                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &updated))
+        assert.Equal(t, kimov1alpha1.InstancePhaseRunning, updated.Status.Phase)
+
+        require.Len(t, backend.events, 1)
+        assert.Equal(t, integrations.EventRunning, backend.events[0].Type)
+}
+
+func TestInstanceController_UnreadyPodBeyondThresholdGoesUnhealthy(t *testing.T) {
+        scheme := newTestScheme(t)
+        tmpl, instance := newTemplate(), newInstance()
+        instance.Status.Phase = kimov1alpha1.InstancePhaseRunning
+        instance.Status.UnhealthyCount = 2 // one more failure crosses the threshold of 3
+
+        pod := &corev1.Pod{
+                ObjectMeta: metav1.ObjectMeta{
+                        Name: "web-sqli-team-1-abcde", Namespace: "default",
+                        Labels: map[string]string{"kimo.io/instance": "web-sqli-team-1"},
+                },
+                Status: corev1.PodStatus{
+                        Phase: corev1.PodRunning,
+                        Conditions: []corev1.PodCondition{
+                                {Type: corev1.PodReady, Status: corev1.ConditionFalse},
+                        },
+                },
+        }
+
+        client := fake.NewClientBuilder().WithScheme(scheme).
+                WithObjects(tmpl, instance, pod).
+                WithStatusSubresource(instance).
+                Build()
+
+        backend := &recordingBackend{}
+        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme, Backend: backend}
+        _, err := r.Reconcile(context.Background(), reconcile.Request{
+                NamespacedName: types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"},
+        })
+        require.NoError(t, err)
+
+        var updated kimov1alpha1.ChallengeInstance
+        require.NoError(t, client.Get(context.Background(),
+                types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &updated))
+        assert.Equal(t, kimov1alpha1.InstancePhaseUnhealthy, updated.Status.Phase)
+
+        require.Len(t, backend.events, 1)
+        assert.Equal(t, integrations.EventUnhealthy, backend.events[0].Type)
 }
 
 func TestInstanceController_TemplateNotReady(t *testing.T) {
@@ -821,12 +930,8 @@ func TestInstanceController_TemplateNotReady(t *testing.T) {
 
         tmpl := &kimov1alpha1.ChallengeTemplate{
                 ObjectMeta: metav1.ObjectMeta{Name: "broken", Namespace: "default"},
-                Spec: kimov1alpha1.ChallengeTemplateSpec{
-                        Runtime: kimov1alpha1.RuntimeContainer,
-                },
-                Status: kimov1alpha1.ChallengeTemplateStatus{Ready: false},
+                Status:     kimov1alpha1.ChallengeTemplateStatus{Ready: false},
         }
-
         instance := &kimov1alpha1.ChallengeInstance{
                 ObjectMeta: metav1.ObjectMeta{Name: "broken-team-1", Namespace: "default"},
                 Spec: kimov1alpha1.ChallengeInstanceSpec{
@@ -840,12 +945,13 @@ func TestInstanceController_TemplateNotReady(t *testing.T) {
                 WithStatusSubresource(instance).
                 Build()
 
-        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme}
+        backend := &recordingBackend{}
+        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme, Backend: backend}
         result, err := r.Reconcile(context.Background(), reconcile.Request{
                 NamespacedName: types.NamespacedName{Name: "broken-team-1", Namespace: "default"},
         })
         require.NoError(t, err)
-        assert.NotZero(t, result.RequeueAfter) // requeue to wait for template
+        assert.NotZero(t, result.RequeueAfter)
 
         var updated kimov1alpha1.ChallengeInstance
         require.NoError(t, client.Get(context.Background(),
@@ -873,6 +979,7 @@ import (
         "time"
 
         kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+        "github.com/hermannchristopher/kimo/internal/integrations"
         appsv1 "k8s.io/api/apps/v1"
         corev1 "k8s.io/api/core/v1"
         "k8s.io/apimachinery/pkg/api/errors"
@@ -888,13 +995,14 @@ import (
 
 type ChallengeInstanceReconciler struct {
         client.Client
-        Scheme *runtime.Scheme
+        Scheme  *runtime.Scheme
+        Backend integrations.Backend
 }
 
 // +kubebuilder:rbac:groups=kimo.kimo.io,resources=challengeinstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kimo.kimo.io,resources=challengeinstances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services;pods,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ChallengeInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
         logger := log.FromContext(ctx)
@@ -907,104 +1015,183 @@ func (r *ChallengeInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Re
                 return ctrl.Result{}, err
         }
 
-        // Skip if already expired
-        if instance.Status.Phase == kimov1alpha1.InstancePhaseExpired {
+        if terminal(instance.Status.Phase) {
                 return ctrl.Result{}, nil
         }
 
-        // Fetch template
         var tmpl kimov1alpha1.ChallengeTemplate
         if err := r.Get(ctx, types.NamespacedName{Name: instance.Spec.TemplateRef, Namespace: instance.Namespace}, &tmpl); err != nil {
                 if errors.IsNotFound(err) {
-                        return r.setInstanceStatus(ctx, &instance, kimov1alpha1.InstancePhaseFailed, "template not found: "+instance.Spec.TemplateRef)
+                        return r.transition(ctx, &instance, kimov1alpha1.InstancePhaseFailed, "template not found: "+instance.Spec.TemplateRef)
                 }
                 return ctrl.Result{}, err
         }
 
-        // Wait for template to be ready
         if !tmpl.Status.Ready {
-                r.setInstanceStatus(ctx, &instance, kimov1alpha1.InstancePhasePending, "waiting for template to be ready")
+                r.transition(ctx, &instance, kimov1alpha1.InstancePhasePending, "waiting for template to be ready")
                 return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
         }
 
-        // Route by runtime type
-        switch tmpl.Spec.Runtime {
-        case kimov1alpha1.RuntimeContainer:
-                return r.reconcileContainer(ctx, &instance, &tmpl)
-        case kimov1alpha1.RuntimeVM:
-                return r.reconcileVM(ctx, &instance, &tmpl)
-        default:
-                return r.setInstanceStatus(ctx, &instance, kimov1alpha1.InstancePhaseFailed, "unknown runtime: "+string(tmpl.Spec.Runtime))
+        if err := r.ensureWorkload(ctx, &instance, &tmpl); err != nil {
+                return ctrl.Result{}, err
         }
 
-        _ = logger
-        return ctrl.Result{}, nil
+        if err := r.ensureExpiry(&instance, &tmpl); err != nil {
+                return r.transition(ctx, &instance, kimov1alpha1.InstancePhaseFailed, err.Error())
+        }
+
+        phase, reason, err := r.determinePhase(ctx, &instance, &tmpl)
+        if err != nil {
+                return ctrl.Result{}, err
+        }
+
+        logger.Info("instance reconciled", "name", instance.Name, "phase", phase)
+        return r.transition(ctx, &instance, phase, reason)
 }
 
-func (r *ChallengeInstanceReconciler) reconcileContainer(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) (ctrl.Result, error) {
-        // Create Deployment
+func terminal(p kimov1alpha1.InstancePhase) bool {
+        return p == kimov1alpha1.InstancePhaseExpired || p == kimov1alpha1.InstancePhaseFailed
+}
+
+func (r *ChallengeInstanceReconciler) ensureWorkload(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) error {
         dep := r.buildDeployment(instance, tmpl)
         if err := controllerutil.SetControllerReference(instance, dep, r.Scheme); err != nil {
-                return ctrl.Result{}, fmt.Errorf("setting owner reference: %w", err)
+                return fmt.Errorf("setting owner reference: %w", err)
         }
-
         var existing appsv1.Deployment
         if err := r.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, &existing); err != nil {
-                if errors.IsNotFound(err) {
-                        if err := r.Create(ctx, dep); err != nil {
-                                return ctrl.Result{}, fmt.Errorf("creating deployment: %w", err)
-                        }
-                } else {
-                        return ctrl.Result{}, err
+                if !errors.IsNotFound(err) {
+                        return err
+                }
+                if err := r.Create(ctx, dep); err != nil {
+                        return fmt.Errorf("creating deployment: %w", err)
                 }
         }
 
-        // Create Service for exposed ports
         if svc := r.buildService(instance, tmpl); svc != nil {
                 if err := controllerutil.SetControllerReference(instance, svc, r.Scheme); err != nil {
-                        return ctrl.Result{}, err
+                        return err
                 }
                 var existingSvc corev1.Service
                 if err := r.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, &existingSvc); err != nil {
-                        if errors.IsNotFound(err) {
-                                if err := r.Create(ctx, svc); err != nil {
-                                        return ctrl.Result{}, fmt.Errorf("creating service: %w", err)
-                                }
-                        } else {
-                                return ctrl.Result{}, err
+                        if !errors.IsNotFound(err) {
+                                return err
+                        }
+                        if err := r.Create(ctx, svc); err != nil {
+                                return fmt.Errorf("creating service: %w", err)
                         }
                 }
         }
 
-        // Set expiry time
+        instance.Status.PodName = dep.Name
+        return nil
+}
+
+func (r *ChallengeInstanceReconciler) ensureExpiry(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) error {
+        if instance.Status.ExpiresAt != nil {
+                return nil
+        }
         ttl := tmpl.Spec.TTL
         if instance.Spec.TTLOverride != "" {
                 ttl = instance.Spec.TTLOverride
         }
         duration, err := time.ParseDuration(ttl)
         if err != nil {
-                return r.setInstanceStatus(ctx, instance, kimov1alpha1.InstancePhaseFailed, "invalid TTL: "+ttl)
+                return fmt.Errorf("invalid TTL: %s", ttl)
+        }
+        now := metav1.Now()
+        instance.Status.StartedAt = &now
+        expiresAt := metav1.NewTime(now.Add(duration))
+        instance.Status.ExpiresAt = &expiresAt
+        return nil
+}
+
+// determinePhase inspects the owned Pod's status to drive the lifecycle
+// state machine: no pod yet -> Creating; pod ready -> Running; pod running
+// but failing readiness past the template's threshold -> Unhealthy.
+func (r *ChallengeInstanceReconciler) determinePhase(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) (kimov1alpha1.InstancePhase, string, error) {
+        var pods corev1.PodList
+        if err := r.List(ctx, &pods, client.InNamespace(instance.Namespace),
+                client.MatchingLabels{"kimo.io/instance": instance.Name}); err != nil {
+                return "", "", err
+        }
+        if len(pods.Items) == 0 {
+                return kimov1alpha1.InstancePhaseCreating, "waiting for pod to be scheduled", nil
         }
 
-        now := metav1.Now()
-        if instance.Status.StartedAt == nil {
-                instance.Status.StartedAt = &now
+        pod := pods.Items[0]
+        switch pod.Status.Phase {
+        case corev1.PodFailed:
+                return kimov1alpha1.InstancePhaseFailed, "pod failed: " + pod.Status.Reason, nil
+        case corev1.PodRunning:
+                if podReady(&pod) {
+                        instance.Status.UnhealthyCount = 0
+                        return kimov1alpha1.InstancePhaseRunning, "", nil
+                }
+                threshold := tmpl.Spec.Container.UnhealthyThreshold
+                if threshold == 0 {
+                        threshold = 3
+                }
+                instance.Status.UnhealthyCount++
+                if instance.Status.UnhealthyCount >= threshold {
+                        return kimov1alpha1.InstancePhaseUnhealthy, "pod failing readiness checks", nil
+                }
+                return kimov1alpha1.InstancePhaseCreating, "waiting for pod to become ready", nil
+        default:
+                return kimov1alpha1.InstancePhaseCreating, "waiting for pod to start", nil
         }
-        expiresAt := metav1.NewTime(instance.Status.StartedAt.Add(duration))
-        instance.Status.ExpiresAt = &expiresAt
-        instance.Status.Phase = kimov1alpha1.InstancePhasePending
-        instance.Status.PodName = dep.Name
+}
+
+func podReady(pod *corev1.Pod) bool {
+        for _, c := range pod.Status.Conditions {
+                if c.Type == corev1.PodReady {
+                        return c.Status == corev1.ConditionTrue
+                }
+        }
+        return false
+}
+
+// transition updates status and, on an actual phase change, notifies the
+// active scoring backend.
+func (r *ChallengeInstanceReconciler) transition(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, phase kimov1alpha1.InstancePhase, reason string) (ctrl.Result, error) {
+        changed := instance.Status.Phase != phase
+        instance.Status.Phase = phase
+        instance.Status.Reason = reason
 
         if err := r.Status().Update(ctx, instance); err != nil {
                 return ctrl.Result{}, err
         }
 
+        if changed && r.Backend != nil {
+                if evt, ok := eventForPhase(phase); ok {
+                        _ = r.Backend.Notify(ctx, integrations.Event{
+                                Type:      evt,
+                                Instance:  instance.Name,
+                                Challenge: instance.Spec.TemplateRef,
+                                Team:      instance.Spec.Team,
+                                Player:    instance.Spec.Player,
+                                Endpoint:  instance.Status.Endpoint,
+                                Reason:    reason,
+                        })
+                }
+        }
+
         return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
-func (r *ChallengeInstanceReconciler) reconcileVM(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) (ctrl.Result, error) {
-        // TODO: Implement KubeVirt VMI creation in Task 6
-        return r.setInstanceStatus(ctx, instance, kimov1alpha1.InstancePhasePending, "VM runtime not yet implemented")
+func eventForPhase(phase kimov1alpha1.InstancePhase) (integrations.EventType, bool) {
+        switch phase {
+        case kimov1alpha1.InstancePhaseCreating:
+                return integrations.EventCreating, true
+        case kimov1alpha1.InstancePhaseRunning:
+                return integrations.EventRunning, true
+        case kimov1alpha1.InstancePhaseUnhealthy:
+                return integrations.EventUnhealthy, true
+        case kimov1alpha1.InstancePhaseFailed:
+                return integrations.EventFailed, true
+        default:
+                return "", false
+        }
 }
 
 func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) *appsv1.Deployment {
@@ -1015,40 +1202,42 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
                 "kimo.io/instance":  instance.Name,
         }
 
-        containers := []corev1.Container{
-                {
-                        Name:  "challenge",
-                        Image: tmpl.Spec.Container.Image,
-                        Env:   tmpl.Spec.Container.Env,
-                        SecurityContext: &corev1.SecurityContext{
-                                RunAsNonRoot:             boolPtr(true),
-                                ReadOnlyRootFilesystem:   boolPtr(true),
-                                AllowPrivilegeEscalation: boolPtr(false),
-                        },
+        c := tmpl.Spec.Container
+        container := corev1.Container{
+                Name:  "challenge",
+                Image: c.Image,
+                Env:   c.Env,
+                SecurityContext: &corev1.SecurityContext{
+                        RunAsNonRoot:             boolPtr(true),
+                        ReadOnlyRootFilesystem:   boolPtr(true),
+                        AllowPrivilegeEscalation: boolPtr(false),
                 },
         }
+        for _, p := range c.Ports {
+                container.Ports = append(container.Ports, corev1.ContainerPort{Name: p.Name, ContainerPort: p.ContainerPort})
+        }
+        if probe := buildReadinessProbe(c); probe != nil {
+                container.ReadinessProbe = probe
+        }
 
-        // Map ports
-        for _, p := range tmpl.Spec.Container.Ports {
-                containers[0].Ports = append(containers[0].Ports, corev1.ContainerPort{
-                        Name:          p.Name,
-                        ContainerPort: p.ContainerPort,
-                })
+        restartPolicy := corev1.RestartPolicyOnFailure
+        switch c.RestartPolicy {
+        case kimov1alpha1.RestartAlways:
+                restartPolicy = corev1.RestartPolicyAlways
+        case kimov1alpha1.RestartNever:
+                restartPolicy = corev1.RestartPolicyNever
         }
 
         return &appsv1.Deployment{
-                ObjectMeta: metav1.ObjectMeta{
-                        Name:      instance.Name,
-                        Namespace: instance.Namespace,
-                        Labels:    labels,
-                },
+                ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace, Labels: labels},
                 Spec: appsv1.DeploymentSpec{
                         Replicas: &replicas,
                         Selector: &metav1.LabelSelector{MatchLabels: labels},
                         Template: corev1.PodTemplateSpec{
                                 ObjectMeta: metav1.ObjectMeta{Labels: labels},
                                 Spec: corev1.PodSpec{
-                                        Containers:                containers,
+                                        Containers:                   []corev1.Container{container},
+                                        RestartPolicy:                restartPolicy,
                                         AutomountServiceAccountToken: boolPtr(false),
                                 },
                         },
@@ -1056,26 +1245,44 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
         }
 }
 
+func buildReadinessProbe(c kimov1alpha1.ContainerSpec) *corev1.Probe {
+        readiness := c.Readiness
+        if readiness != nil && readiness.Type == kimov1alpha1.ReadinessNone {
+                return nil
+        }
+
+        port := int32(0)
+        if readiness != nil && readiness.Port != 0 {
+                port = readiness.Port
+        } else if len(c.Ports) > 0 {
+                port = c.Ports[0].ContainerPort
+        }
+        if port == 0 {
+                return nil
+        }
+
+        if readiness != nil && readiness.Type == kimov1alpha1.ReadinessHTTP {
+                return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+                        HTTPGet: &corev1.HTTPGetAction{Path: readiness.Path, Port: intstr.FromInt32(port)},
+                }}
+        }
+        return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+                TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(port)},
+        }}
+}
+
 func (r *ChallengeInstanceReconciler) buildService(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) *corev1.Service {
         var ports []corev1.ServicePort
         for _, p := range tmpl.Spec.Container.Ports {
                 if p.Expose {
-                        ports = append(ports, corev1.ServicePort{
-                                Name:       p.Name,
-                                Port:       p.ContainerPort,
-                                TargetPort: intstr.FromInt32(p.ContainerPort),
-                        })
+                        ports = append(ports, corev1.ServicePort{Name: p.Name, Port: p.ContainerPort, TargetPort: intstr.FromInt32(p.ContainerPort)})
                 }
         }
         if len(ports) == 0 {
                 return nil
         }
-
         return &corev1.Service{
-                ObjectMeta: metav1.ObjectMeta{
-                        Name:      instance.Name,
-                        Namespace: instance.Namespace,
-                },
+                ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace},
                 Spec: corev1.ServiceSpec{
                         Selector: map[string]string{"kimo.io/instance": instance.Name},
                         Ports:    ports,
@@ -1084,15 +1291,6 @@ func (r *ChallengeInstanceReconciler) buildService(instance *kimov1alpha1.Challe
 }
 
 func boolPtr(b bool) *bool { return &b }
-
-func (r *ChallengeInstanceReconciler) setInstanceStatus(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, phase kimov1alpha1.InstancePhase, msg string) (ctrl.Result, error) {
-        instance.Status.Phase = phase
-        instance.Status.Message = msg
-        if err := r.Status().Update(ctx, instance); err != nil {
-                return ctrl.Result{}, err
-        }
-        return ctrl.Result{}, nil
-}
 
 func (r *ChallengeInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
         return ctrl.NewControllerManagedBy(mgr).
@@ -1115,182 +1313,600 @@ Expected: all tests PASS.
 
 ```bash
 git add -A
-git commit -m "feat: implement Instance Controller for container runtime"
+git commit -m "feat: implement Instance Controller with container lifecycle state machine"
 ```
 
 ---
 
-### Task 6: Instance Controller — VM Runtime (KubeVirt)
+### Task 6: Backend Interface & Registry
 
 **Files:**
-- Modify: `internal/controller/challengeinstance_controller.go`
-- Modify: `internal/controller/challengeinstance_controller_test.go`
+- Create: `internal/integrations/backend.go`
+- Create: `internal/integrations/backend_test.go`
 
-**Step 1: Add KubeVirt dependency**
+This is the plugin seam every scoring-platform integration goes through — the piece that makes "integrate any backend easily" concrete rather than aspirational.
+
+**Step 1: Write the failing test**
+
+Create `internal/integrations/backend_test.go`:
+
+```go
+package integrations
+
+import (
+        "context"
+        "encoding/json"
+        "net/http"
+        "testing"
+
+        "github.com/stretchr/testify/assert"
+        "github.com/stretchr/testify/require"
+)
+
+type stubBackend struct{ name string }
+
+func (s *stubBackend) Name() string { return s.name }
+func (s *stubBackend) Notify(context.Context, Event) error { return nil }
+func (s *stubBackend) Authenticate(*http.Request) (Principal, error) { return Principal{}, nil }
+
+func TestRegistry_RegisterAndNew(t *testing.T) {
+        Register("stub-for-test", func(cfg json.RawMessage) (Backend, error) {
+                return &stubBackend{name: "stub-for-test"}, nil
+        })
+
+        b, err := New("stub-for-test", nil)
+        require.NoError(t, err)
+        assert.Equal(t, "stub-for-test", b.Name())
+}
+
+func TestRegistry_UnknownBackend(t *testing.T) {
+        _, err := New("does-not-exist", nil)
+        assert.Error(t, err)
+}
+```
+
+**Step 2: Run test to verify it fails**
 
 ```bash
-go get kubevirt.io/api@latest
-go get kubevirt.io/client-go@latest
+go test ./internal/integrations/ -run TestRegistry -v
 ```
 
-**Step 2: Write the failing test for VM provisioning**
+**Step 3: Implement the interface and registry**
 
-Append to `internal/controller/challengeinstance_controller_test.go`:
-
-```go
-func TestInstanceController_CreatesVMI(t *testing.T) {
-        scheme := newTestScheme(t)
-        // Add KubeVirt types to scheme
-        require.NoError(t, kubevirtv1.AddToScheme(scheme))
-
-        tmpl := &kimov1alpha1.ChallengeTemplate{
-                ObjectMeta: metav1.ObjectMeta{Name: "pwn-vm", Namespace: "default"},
-                Spec: kimov1alpha1.ChallengeTemplateSpec{
-                        Runtime:       kimov1alpha1.RuntimeVM,
-                        TTL:           "60m",
-                        MaxInstances:  50,
-                        InstanceMode:  kimov1alpha1.InstanceModePerTeam,
-                        FlagSecretRef: corev1.LocalObjectReference{Name: "flag"},
-                        VM: &kimov1alpha1.VMSpec{
-                                Image:    "registry.ctf.io/vms/pwn:v1",
-                                CPUs:     2,
-                                Memory:   resource.MustParse("2Gi"),
-                                DiskSize: resource.MustParse("10Gi"),
-                        },
-                },
-                Status: kimov1alpha1.ChallengeTemplateStatus{Ready: true},
-        }
-
-        instance := &kimov1alpha1.ChallengeInstance{
-                ObjectMeta: metav1.ObjectMeta{
-                        Name: "pwn-vm-team-1", Namespace: "default",
-                        Labels: map[string]string{"kimo.io/challenge": "pwn-vm", "kimo.io/team": "team-1"},
-                },
-                Spec: kimov1alpha1.ChallengeInstanceSpec{
-                        TemplateRef: "pwn-vm",
-                        Team:        "team-1",
-                },
-        }
-
-        client := fake.NewClientBuilder().WithScheme(scheme).
-                WithObjects(tmpl, instance).
-                WithStatusSubresource(instance).
-                Build()
-
-        r := &ChallengeInstanceReconciler{Client: client, Scheme: scheme}
-        _, err := r.Reconcile(context.Background(), reconcile.Request{
-                NamespacedName: types.NamespacedName{Name: "pwn-vm-team-1", Namespace: "default"},
-        })
-        require.NoError(t, err)
-
-        // Verify VMI created
-        var vmi kubevirtv1.VirtualMachineInstance
-        err = client.Get(context.Background(),
-                types.NamespacedName{Name: "pwn-vm-team-1", Namespace: "default"}, &vmi)
-        require.NoError(t, err)
-        assert.Equal(t, uint32(2), vmi.Spec.Domain.CPU.Cores)
-}
-```
-
-**Step 3: Implement `reconcileVM`**
-
-Fill in the `reconcileVM` method in `challengeinstance_controller.go`:
+Create `internal/integrations/backend.go`:
 
 ```go
-func (r *ChallengeInstanceReconciler) reconcileVM(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) (ctrl.Result, error) {
-        vmi := r.buildVMI(instance, tmpl)
-        if err := controllerutil.SetControllerReference(instance, vmi, r.Scheme); err != nil {
-                return ctrl.Result{}, err
-        }
+package integrations
 
-        var existing kubevirtv1.VirtualMachineInstance
-        if err := r.Get(ctx, types.NamespacedName{Name: vmi.Name, Namespace: vmi.Namespace}, &existing); err != nil {
-                if errors.IsNotFound(err) {
-                        if err := r.Create(ctx, vmi); err != nil {
-                                return ctrl.Result{}, fmt.Errorf("creating VMI: %w", err)
-                        }
-                } else {
-                        return ctrl.Result{}, err
-                }
-        }
+import (
+        "context"
+        "encoding/json"
+        "fmt"
+        "net/http"
+        "time"
+)
 
-        // Set TTL and status
-        ttl := tmpl.Spec.TTL
-        if instance.Spec.TTLOverride != "" {
-                ttl = instance.Spec.TTLOverride
-        }
-        duration, _ := time.ParseDuration(ttl)
-        now := metav1.Now()
-        if instance.Status.StartedAt == nil {
-                instance.Status.StartedAt = &now
-        }
-        expiresAt := metav1.NewTime(instance.Status.StartedAt.Add(duration))
-        instance.Status.ExpiresAt = &expiresAt
-        instance.Status.Phase = kimov1alpha1.InstancePhasePending
-        instance.Status.VMName = vmi.Name
+// EventType identifies a ChallengeInstance lifecycle transition.
+type EventType string
 
-        if err := r.Status().Update(ctx, instance); err != nil {
-                return ctrl.Result{}, err
-        }
+const (
+        EventCreating  EventType = "instance.creating"
+        EventRunning   EventType = "instance.running"
+        EventUnhealthy EventType = "instance.unhealthy"
+        EventExpiring  EventType = "instance.expiring"
+        EventExpired   EventType = "instance.expired"
+        EventFailed    EventType = "instance.failed"
+        EventDeleted   EventType = "instance.deleted"
+)
 
-        return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+// Event is dispatched to the active backend on every ChallengeInstance
+// phase transition.
+type Event struct {
+        Type      EventType
+        Instance  string
+        Challenge string
+        Team      string
+        Player    string
+        Endpoint  string
+        Reason    string
+        Timestamp time.Time
 }
 
-func (r *ChallengeInstanceReconciler) buildVMI(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) *kubevirtv1.VirtualMachineInstance {
-        labels := map[string]string{
-                "kimo.io/challenge": tmpl.Name,
-                "kimo.io/team":      instance.Spec.Team,
-                "kimo.io/instance":  instance.Name,
-        }
+// Principal identifies the caller of a KIMO API request, as resolved by
+// the active backend's own auth scheme.
+type Principal struct {
+        Subject string
+        Team    string
+        Scopes  []string
+}
 
-        return &kubevirtv1.VirtualMachineInstance{
-                ObjectMeta: metav1.ObjectMeta{
-                        Name:      instance.Name,
-                        Namespace: instance.Namespace,
-                        Labels:    labels,
-                },
-                Spec: kubevirtv1.VirtualMachineInstanceSpec{
-                        Domain: kubevirtv1.DomainSpec{
-                                CPU: &kubevirtv1.CPU{
-                                        Cores: uint32(tmpl.Spec.VM.CPUs),
-                                },
-                                Memory: &kubevirtv1.Memory{
-                                        Guest: &tmpl.Spec.VM.Memory,
-                                },
-                        },
-                        Volumes: []kubevirtv1.Volume{
-                                {
-                                        Name: "disk0",
-                                        VolumeSource: kubevirtv1.VolumeSource{
-                                                ContainerDisk: &kubevirtv1.ContainerDiskSource{
-                                                        Image: tmpl.Spec.VM.Image,
-                                                },
-                                        },
-                                },
-                        },
-                },
+// Backend is implemented by every scoring-platform integration. It is the
+// single seam between KIMO's controllers/API and an external platform.
+type Backend interface {
+        Name() string
+        Notify(ctx context.Context, event Event) error
+        Authenticate(r *http.Request) (Principal, error)
+}
+
+// Factory constructs a Backend from its opaque, backend-specific config.
+type Factory func(cfg json.RawMessage) (Backend, error)
+
+var registry = map[string]Factory{}
+
+// Register makes a backend available by name. Called from each adapter's
+// init() — this is how a new integration becomes selectable without
+// touching any controller or API code.
+func Register(name string, factory Factory) {
+        registry[name] = factory
+}
+
+// New constructs the named backend from config. Returns an error if no
+// backend was registered under that name.
+func New(name string, cfg json.RawMessage) (Backend, error) {
+        factory, ok := registry[name]
+        if !ok {
+                return nil, fmt.Errorf("unknown scoring backend %q", name)
         }
+        return factory(cfg)
 }
 ```
 
 **Step 4: Run tests**
 
 ```bash
-go test ./internal/controller/ -run TestInstanceController -v
+go test ./internal/integrations/ -v
 ```
 
-Expected: all tests PASS.
+Expected: PASS.
 
 **Step 5: Commit**
 
 ```bash
 git add -A
-git commit -m "feat: add KubeVirt VM runtime support to Instance Controller"
+git commit -m "feat: add pluggable scoring backend interface and registry"
 ```
 
 ---
 
-### Task 7: Network Controller
+### Task 7: Generic Backend Adapter (default)
+
+**Files:**
+- Create: `internal/integrations/generic.go`
+- Create: `internal/integrations/generic_test.go`
+
+The `generic` backend is the zero-config default: HMAC-signed webhook fan-out plus a static Bearer API key, equivalent to what earlier revisions of this plan baked directly into the API server. Every deployment that doesn't need a specific platform integration uses this one unmodified.
+
+**Step 1: Write the failing test**
+
+Create `internal/integrations/generic_test.go`:
+
+```go
+package integrations
+
+import (
+        "context"
+        "crypto/hmac"
+        "crypto/sha256"
+        "encoding/hex"
+        "encoding/json"
+        "net/http"
+        "net/http/httptest"
+        "testing"
+
+        "github.com/stretchr/testify/assert"
+        "github.com/stretchr/testify/require"
+)
+
+func TestGenericBackend_NotifySignsPayload(t *testing.T) {
+        var gotSig, gotBody string
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                gotSig = r.Header.Get("X-KIMO-Signature")
+                body := make([]byte, r.ContentLength)
+                r.Body.Read(body)
+                gotBody = string(body)
+                w.WriteHeader(http.StatusOK)
+        }))
+        defer srv.Close()
+
+        b, err := newGenericBackend(nil)
+        require.NoError(t, err)
+        gb := b.(*genericBackend)
+        gb.RegisterWebhook(srv.URL, "shared-secret")
+
+        err = gb.Notify(context.Background(), Event{Type: EventRunning, Instance: "web-sqli-team-1"})
+        require.NoError(t, err)
+
+        mac := hmac.New(sha256.New, []byte("shared-secret"))
+        mac.Write([]byte(gotBody))
+        assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), gotSig)
+}
+
+func TestGenericBackend_AuthenticateRejectsWrongKey(t *testing.T) {
+        b, err := newGenericBackend(json.RawMessage(`{"apiKey":"secret-key"}`))
+        require.NoError(t, err)
+
+        req := httptest.NewRequest(http.MethodGet, "/", nil)
+        req.Header.Set("Authorization", "Bearer wrong-key")
+        _, err = b.Authenticate(req)
+        assert.Error(t, err)
+}
+
+func TestGenericBackend_AuthenticateAcceptsValidKey(t *testing.T) {
+        b, err := newGenericBackend(json.RawMessage(`{"apiKey":"secret-key"}`))
+        require.NoError(t, err)
+
+        req := httptest.NewRequest(http.MethodGet, "/", nil)
+        req.Header.Set("Authorization", "Bearer secret-key")
+        _, err = b.Authenticate(req)
+        assert.NoError(t, err)
+}
+```
+
+**Step 2: Run tests to verify they fail**
+
+```bash
+go test ./internal/integrations/ -run TestGenericBackend -v
+```
+
+**Step 3: Implement the generic backend**
+
+Create `internal/integrations/generic.go`:
+
+```go
+package integrations
+
+import (
+        "bytes"
+        "context"
+        "crypto/hmac"
+        "crypto/sha256"
+        "encoding/hex"
+        "encoding/json"
+        "errors"
+        "fmt"
+        "net/http"
+        "sync"
+)
+
+func init() {
+        Register("generic", newGenericBackend)
+}
+
+type genericConfig struct {
+        APIKey string `json:"apiKey"`
+}
+
+// genericBackend is the zero-config default: HMAC-signed webhook fan-out
+// and a static Bearer API key.
+type genericBackend struct {
+        apiKey string
+        mu     sync.RWMutex
+        hooks  map[string]string // url -> hmac secret
+}
+
+func newGenericBackend(cfg json.RawMessage) (Backend, error) {
+        var c genericConfig
+        if len(cfg) > 0 {
+                if err := json.Unmarshal(cfg, &c); err != nil {
+                        return nil, fmt.Errorf("parsing generic backend config: %w", err)
+                }
+        }
+        return &genericBackend{apiKey: c.APIKey, hooks: map[string]string{}}, nil
+}
+
+func (b *genericBackend) Name() string { return "generic" }
+
+// RegisterWebhook implements integrations.WebhookRegistrar, letting the API
+// server's /webhooks/configure endpoint stay backend-agnostic.
+func (b *genericBackend) RegisterWebhook(url, secret string) error {
+        b.mu.Lock()
+        defer b.mu.Unlock()
+        b.hooks[url] = secret
+        return nil
+}
+
+func (b *genericBackend) Notify(ctx context.Context, event Event) error {
+        b.mu.RLock()
+        hooks := make(map[string]string, len(b.hooks))
+        for u, s := range b.hooks {
+                hooks[u] = s
+        }
+        b.mu.RUnlock()
+
+        payload, err := json.Marshal(event)
+        if err != nil {
+                return err
+        }
+
+        var errs []error
+        for url, secret := range hooks {
+                if err := postSigned(ctx, url, secret, payload); err != nil {
+                        errs = append(errs, err)
+                }
+        }
+        return errors.Join(errs...)
+}
+
+func (b *genericBackend) Authenticate(r *http.Request) (Principal, error) {
+        if r.Header.Get("Authorization") != "Bearer "+b.apiKey {
+                return Principal{}, fmt.Errorf("unauthorized")
+        }
+        return Principal{Subject: "api-key", Scopes: []string{"admin"}}, nil
+}
+
+func postSigned(ctx context.Context, url, secret string, payload []byte) error {
+        mac := hmac.New(sha256.New, []byte(secret))
+        mac.Write(payload)
+        sig := hex.EncodeToString(mac.Sum(nil))
+
+        req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+        if err != nil {
+                return err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("X-KIMO-Signature", sig)
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+                return err
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 300 {
+                return fmt.Errorf("webhook %s returned %d", url, resp.StatusCode)
+        }
+        return nil
+}
+```
+
+Also add the `WebhookRegistrar` interface to `internal/integrations/backend.go` (Task 6's file):
+
+```go
+// WebhookRegistrar is an optional capability a Backend can implement to
+// support runtime webhook registration via the REST API. Only the generic
+// backend implements it today.
+type WebhookRegistrar interface {
+        RegisterWebhook(url, secret string) error
+}
+```
+
+**Step 4: Run tests**
+
+```bash
+go test ./internal/integrations/ -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat: implement generic HMAC-webhook scoring backend adapter"
+```
+
+---
+
+### Task 8: CTFd Backend Adapter (worked example)
+
+**Files:**
+- Create: `internal/integrations/ctfd.go`
+- Create: `internal/integrations/ctfd_test.go`
+
+This adapter exists to prove out and document the "add a new backend" path from the design doc: a self-contained file, an `init()` registration, no controller or API changes required.
+
+**Step 1: Write the failing test**
+
+Create `internal/integrations/ctfd_test.go`:
+
+```go
+package integrations
+
+import (
+        "context"
+        "encoding/json"
+        "net/http"
+        "net/http/httptest"
+        "testing"
+
+        "github.com/stretchr/testify/assert"
+        "github.com/stretchr/testify/require"
+)
+
+func TestCTFdBackend_NotifyPostsTranslatedPayload(t *testing.T) {
+        var gotType string
+        webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                var body map[string]interface{}
+                json.NewDecoder(r.Body).Decode(&body)
+                gotType, _ = body["type"].(string)
+                w.WriteHeader(http.StatusOK)
+        }))
+        defer webhook.Close()
+
+        cfg, _ := json.Marshal(ctfdConfig{BaseURL: "https://ctfd.example.com", WebhookURL: webhook.URL, APIKey: "k"})
+        b, err := newCTFdBackend(cfg)
+        require.NoError(t, err)
+
+        err = b.Notify(context.Background(), Event{Type: EventRunning, Challenge: "web-sqli", Team: "42"})
+        require.NoError(t, err)
+        assert.Equal(t, string(EventRunning), gotType)
+}
+
+func TestCTFdBackend_AuthenticateValidatesAgainstCTFd(t *testing.T) {
+        ctfd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if r.Header.Get("Authorization") != "Token good-token" {
+                        w.WriteHeader(http.StatusUnauthorized)
+                        return
+                }
+                json.NewEncoder(w).Encode(map[string]interface{}{
+                        "data": map[string]interface{}{"id": 1, "name": "team42", "team_id": 42},
+                })
+        }))
+        defer ctfd.Close()
+
+        cfg, _ := json.Marshal(ctfdConfig{BaseURL: ctfd.URL})
+        b, err := newCTFdBackend(cfg)
+        require.NoError(t, err)
+
+        req := httptest.NewRequest(http.MethodGet, "/", nil)
+        req.Header.Set("Authorization", "Token good-token")
+        principal, err := b.Authenticate(req)
+        require.NoError(t, err)
+        assert.Equal(t, "team42", principal.Subject)
+        assert.Equal(t, "42", principal.Team)
+
+        req.Header.Set("Authorization", "Token bad-token")
+        _, err = b.Authenticate(req)
+        assert.Error(t, err)
+}
+
+func TestCTFdBackend_RequiresBaseURL(t *testing.T) {
+        _, err := newCTFdBackend(json.RawMessage(`{}`))
+        assert.Error(t, err)
+}
+```
+
+**Step 2: Run tests to verify they fail**
+
+```bash
+go test ./internal/integrations/ -run TestCTFdBackend -v
+```
+
+**Step 3: Implement the CTFd adapter**
+
+Create `internal/integrations/ctfd.go`:
+
+```go
+package integrations
+
+import (
+        "bytes"
+        "context"
+        "encoding/json"
+        "fmt"
+        "net/http"
+)
+
+func init() {
+        Register("ctfd", newCTFdBackend)
+}
+
+type ctfdConfig struct {
+        BaseURL    string `json:"baseUrl"`    // CTFd instance, used for Authenticate
+        WebhookURL string `json:"webhookUrl"` // where lifecycle events are POSTed; optional
+        APIKey     string `json:"apiKey"`     // KIMO -> CTFd calls
+}
+
+type ctfdBackend struct {
+        cfg    ctfdConfig
+        client *http.Client
+}
+
+func newCTFdBackend(cfg json.RawMessage) (Backend, error) {
+        var c ctfdConfig
+        if err := json.Unmarshal(cfg, &c); err != nil {
+                return nil, fmt.Errorf("parsing ctfd backend config: %w", err)
+        }
+        if c.BaseURL == "" {
+                return nil, fmt.Errorf("ctfd backend requires baseUrl")
+        }
+        return &ctfdBackend{cfg: c, client: http.DefaultClient}, nil
+}
+
+func (b *ctfdBackend) Name() string { return "ctfd" }
+
+type ctfdEventPayload struct {
+        Type      string `json:"type"`
+        Challenge string `json:"challenge_id"`
+        Team      string `json:"team_id"`
+        URL       string `json:"instance_url"`
+}
+
+func (b *ctfdBackend) Notify(ctx context.Context, event Event) error {
+        if b.cfg.WebhookURL == "" {
+                return nil // no CTFd webhook configured — Notify is a no-op
+        }
+        body, err := json.Marshal(ctfdEventPayload{
+                Type:      string(event.Type),
+                Challenge: event.Challenge,
+                Team:      event.Team,
+                URL:       event.Endpoint,
+        })
+        if err != nil {
+                return err
+        }
+        req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.WebhookURL, bytes.NewReader(body))
+        if err != nil {
+                return err
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("Authorization", "Token "+b.cfg.APIKey)
+
+        resp, err := b.client.Do(req)
+        if err != nil {
+                return err
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 300 {
+                return fmt.Errorf("ctfd webhook returned %d", resp.StatusCode)
+        }
+        return nil
+}
+
+// Authenticate validates the caller's CTFd API token by calling CTFd's own
+// /api/v1/users/me — KIMO never stores or issues its own credentials for
+// this backend, CTFd remains the source of truth.
+func (b *ctfdBackend) Authenticate(r *http.Request) (Principal, error) {
+        token := r.Header.Get("Authorization")
+        if token == "" {
+                return Principal{}, fmt.Errorf("missing authorization header")
+        }
+
+        req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, b.cfg.BaseURL+"/api/v1/users/me", nil)
+        if err != nil {
+                return Principal{}, err
+        }
+        req.Header.Set("Authorization", token)
+
+        resp, err := b.client.Do(req)
+        if err != nil {
+                return Principal{}, err
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode != http.StatusOK {
+                return Principal{}, fmt.Errorf("ctfd rejected credentials: %d", resp.StatusCode)
+        }
+
+        var body struct {
+                Data struct {
+                        Name   string `json:"name"`
+                        TeamID int    `json:"team_id"`
+                } `json:"data"`
+        }
+        if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+                return Principal{}, err
+        }
+        return Principal{Subject: body.Data.Name, Team: fmt.Sprintf("%d", body.Data.TeamID)}, nil
+}
+```
+
+**Step 4: Run tests**
+
+```bash
+go test ./internal/integrations/ -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add CTFd scoring backend adapter"
+```
+
+---
+
+### Task 9: Network Controller
 
 **Files:**
 - Modify: `internal/controller/networkfence_controller.go`
@@ -1327,12 +1943,8 @@ func TestNetworkController_CreatesNetworkPolicy(t *testing.T) {
                 ObjectMeta: metav1.ObjectMeta{Name: "web-sqli-team-1", Namespace: "default"},
                 Spec: kimov1alpha1.NetworkFenceSpec{
                         InstanceRef: "web-sqli-team-1",
-                        AllowRules: []kimov1alpha1.AllowRule{
-                                {Port: 8080},
-                        },
-                        DenyRules: []kimov1alpha1.DenyRule{
-                                {To: "kimo-system"},
-                        },
+                        AllowRules:  []kimov1alpha1.AllowRule{{Port: 8080}},
+                        DenyRules:   []kimov1alpha1.DenyRule{{To: "kimo-system"}},
                 },
         }
 
@@ -1347,14 +1959,12 @@ func TestNetworkController_CreatesNetworkPolicy(t *testing.T) {
         })
         require.NoError(t, err)
 
-        // Verify NetworkPolicy created
         var np networkingv1.NetworkPolicy
         err = client.Get(context.Background(),
                 types.NamespacedName{Name: "kimo-web-sqli-team-1", Namespace: "default"}, &np)
         require.NoError(t, err)
         assert.Equal(t, "kimo.io/instance", np.Spec.PodSelector.MatchLabels["kimo.io/instance"])
 
-        // Verify status
         var updated kimov1alpha1.NetworkFence
         require.NoError(t, client.Get(context.Background(),
                 types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, &updated))
@@ -1380,6 +1990,7 @@ import (
         "fmt"
 
         kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+        corev1 "k8s.io/api/core/v1"
         networkingv1 "k8s.io/api/networking/v1"
         "k8s.io/apimachinery/pkg/api/errors"
         metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1446,39 +2057,25 @@ func (r *NetworkFenceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func (r *NetworkFenceReconciler) buildNetworkPolicy(fence *kimov1alpha1.NetworkFence) *networkingv1.NetworkPolicy {
         protocol := corev1.ProtocolTCP
 
-        // Build ingress rules from allow rules
         var ingressPorts []networkingv1.NetworkPolicyPort
         for _, allow := range fence.Spec.AllowRules {
                 if allow.Port > 0 {
                         port := intstr.FromInt32(allow.Port)
-                        ingressPorts = append(ingressPorts, networkingv1.NetworkPolicyPort{
-                                Port:     &port,
-                                Protocol: &protocol,
-                        })
+                        ingressPorts = append(ingressPorts, networkingv1.NetworkPolicyPort{Port: &port, Protocol: &protocol})
                 }
         }
 
-        // Build ingress from CIDRs
         var ingressFrom []networkingv1.NetworkPolicyPeer
         for _, allow := range fence.Spec.AllowRules {
                 if allow.CIDR != "" {
-                        ingressFrom = append(ingressFrom, networkingv1.NetworkPolicyPeer{
-                                IPBlock: &networkingv1.IPBlock{CIDR: allow.CIDR},
-                        })
+                        ingressFrom = append(ingressFrom, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: allow.CIDR}})
                 }
         }
 
-        ingress := []networkingv1.NetworkPolicyIngressRule{
-                {
-                        Ports: ingressPorts,
-                        From:  ingressFrom,
-                },
-        }
+        ingress := []networkingv1.NetworkPolicyIngressRule{{Ports: ingressPorts, From: ingressFrom}}
 
-        // Build egress: deny to specific namespaces, allow rest based on config
         var egressRules []networkingv1.NetworkPolicyEgressRule
         if fence.Spec.AllowEgress {
-                // Allow all egress except to denied namespaces
                 egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{})
         }
 
@@ -1488,16 +2085,9 @@ func (r *NetworkFenceReconciler) buildNetworkPolicy(fence *kimov1alpha1.NetworkF
         }
 
         return &networkingv1.NetworkPolicy{
-                ObjectMeta: metav1.ObjectMeta{
-                        Name:      "kimo-" + fence.Spec.InstanceRef,
-                        Namespace: fence.Namespace,
-                },
+                ObjectMeta: metav1.ObjectMeta{Name: "kimo-" + fence.Spec.InstanceRef, Namespace: fence.Namespace},
                 Spec: networkingv1.NetworkPolicySpec{
-                        PodSelector: metav1.LabelSelector{
-                                MatchLabels: map[string]string{
-                                        "kimo.io/instance": fence.Spec.InstanceRef,
-                                },
-                        },
+                        PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"kimo.io/instance": fence.Spec.InstanceRef}},
                         Ingress:     ingress,
                         Egress:      egressRules,
                         PolicyTypes: policyTypes,
@@ -1512,8 +2102,6 @@ func (r *NetworkFenceReconciler) SetupWithManager(mgr ctrl.Manager) error {
                 Complete(r)
 }
 ```
-
-Note: you'll need to add `corev1` and `networkingv1` imports. The `corev1` import is needed for `corev1.ProtocolTCP`.
 
 **Step 4: Run tests**
 
@@ -1532,11 +2120,13 @@ git commit -m "feat: implement Network Controller with NetworkPolicy creation"
 
 ---
 
-### Task 8: Lifecycle Controller (TTL)
+### Task 10: Lifecycle Controller (TTL + Expiry)
 
 **Files:**
-- Modify: `internal/controller/lifecycle_controller.go` (new file — kubebuilder won't scaffold this since it doesn't own a CRD)
+- Create: `internal/controller/lifecycle_controller.go` (kubebuilder won't scaffold this since it doesn't own a CRD)
 - Create: `internal/controller/lifecycle_controller_test.go`
+
+Drives the tail of the state machine: `Running/Unhealthy -> Expiring -> Expired`, notifying the backend at each step so a scoring platform can, e.g., warn players before teardown.
 
 **Step 1: Write the failing test**
 
@@ -1551,6 +2141,7 @@ import (
         "time"
 
         kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+        "github.com/hermannchristopher/kimo/internal/integrations"
         "github.com/stretchr/testify/assert"
         "github.com/stretchr/testify/require"
         metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1560,6 +2151,34 @@ import (
         "sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+func TestLifecycleController_EntersExpiringWithinGraceWindow(t *testing.T) {
+        scheme := runtime.NewScheme()
+        require.NoError(t, kimov1alpha1.AddToScheme(scheme))
+
+        soon := metav1.NewTime(time.Now().Add(30 * time.Second)) // inside the 60s grace window
+        instance := &kimov1alpha1.ChallengeInstance{
+                ObjectMeta: metav1.ObjectMeta{Name: "soon-inst", Namespace: "default"},
+                Spec:       kimov1alpha1.ChallengeInstanceSpec{TemplateRef: "test", Team: "team-1"},
+                Status:     kimov1alpha1.ChallengeInstanceStatus{Phase: kimov1alpha1.InstancePhaseRunning, ExpiresAt: &soon},
+        }
+
+        client := fake.NewClientBuilder().WithScheme(scheme).
+                WithObjects(instance).WithStatusSubresource(instance).Build()
+
+        backend := &recordingBackend{}
+        r := &LifecycleReconciler{Client: client, Scheme: scheme, Backend: backend}
+        _, err := r.Reconcile(context.Background(), reconcile.Request{
+                NamespacedName: types.NamespacedName{Name: "soon-inst", Namespace: "default"},
+        })
+        require.NoError(t, err)
+
+        var updated kimov1alpha1.ChallengeInstance
+        require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: "soon-inst", Namespace: "default"}, &updated))
+        assert.Equal(t, kimov1alpha1.InstancePhaseExpiring, updated.Status.Phase)
+        require.Len(t, backend.events, 1)
+        assert.Equal(t, integrations.EventExpiring, backend.events[0].Type)
+}
+
 func TestLifecycleController_ExpiresInstance(t *testing.T) {
         scheme := runtime.NewScheme()
         require.NoError(t, kimov1alpha1.AddToScheme(scheme))
@@ -1567,56 +2186,43 @@ func TestLifecycleController_ExpiresInstance(t *testing.T) {
         pastTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
         instance := &kimov1alpha1.ChallengeInstance{
                 ObjectMeta: metav1.ObjectMeta{Name: "expired-inst", Namespace: "default"},
-                Spec: kimov1alpha1.ChallengeInstanceSpec{
-                        TemplateRef: "test",
-                        Team:        "team-1",
-                },
-                Status: kimov1alpha1.ChallengeInstanceStatus{
-                        Phase:     kimov1alpha1.InstancePhaseRunning,
-                        ExpiresAt: &pastTime,
-                },
+                Spec:       kimov1alpha1.ChallengeInstanceSpec{TemplateRef: "test", Team: "team-1"},
+                Status:     kimov1alpha1.ChallengeInstanceStatus{Phase: kimov1alpha1.InstancePhaseExpiring, ExpiresAt: &pastTime},
         }
 
         client := fake.NewClientBuilder().WithScheme(scheme).
-                WithObjects(instance).
-                WithStatusSubresource(instance).
-                Build()
+                WithObjects(instance).WithStatusSubresource(instance).Build()
 
-        r := &LifecycleReconciler{Client: client, Scheme: scheme}
+        backend := &recordingBackend{}
+        r := &LifecycleReconciler{Client: client, Scheme: scheme, Backend: backend}
         _, err := r.Reconcile(context.Background(), reconcile.Request{
                 NamespacedName: types.NamespacedName{Name: "expired-inst", Namespace: "default"},
         })
         require.NoError(t, err)
 
         var updated kimov1alpha1.ChallengeInstance
-        require.NoError(t, client.Get(context.Background(),
-                types.NamespacedName{Name: "expired-inst", Namespace: "default"}, &updated))
+        require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: "expired-inst", Namespace: "default"}, &updated))
         assert.Equal(t, kimov1alpha1.InstancePhaseExpired, updated.Status.Phase)
+        require.Len(t, backend.events, 1)
+        assert.Equal(t, integrations.EventExpired, backend.events[0].Type)
 }
 
-func TestLifecycleController_SkipsNonExpired(t *testing.T) {
+func TestLifecycleController_SkipsInstanceWithPlentyOfTimeLeft(t *testing.T) {
         scheme := runtime.NewScheme()
         require.NoError(t, kimov1alpha1.AddToScheme(scheme))
 
         futureTime := metav1.NewTime(time.Now().Add(30 * time.Minute))
         instance := &kimov1alpha1.ChallengeInstance{
                 ObjectMeta: metav1.ObjectMeta{Name: "active-inst", Namespace: "default"},
-                Spec: kimov1alpha1.ChallengeInstanceSpec{
-                        TemplateRef: "test",
-                        Team:        "team-1",
-                },
-                Status: kimov1alpha1.ChallengeInstanceStatus{
-                        Phase:     kimov1alpha1.InstancePhaseRunning,
-                        ExpiresAt: &futureTime,
-                },
+                Spec:       kimov1alpha1.ChallengeInstanceSpec{TemplateRef: "test", Team: "team-1"},
+                Status:     kimov1alpha1.ChallengeInstanceStatus{Phase: kimov1alpha1.InstancePhaseRunning, ExpiresAt: &futureTime},
         }
 
         client := fake.NewClientBuilder().WithScheme(scheme).
-                WithObjects(instance).
-                WithStatusSubresource(instance).
-                Build()
+                WithObjects(instance).WithStatusSubresource(instance).Build()
 
-        r := &LifecycleReconciler{Client: client, Scheme: scheme}
+        backend := &recordingBackend{}
+        r := &LifecycleReconciler{Client: client, Scheme: scheme, Backend: backend}
         result, err := r.Reconcile(context.Background(), reconcile.Request{
                 NamespacedName: types.NamespacedName{Name: "active-inst", Namespace: "default"},
         })
@@ -1624,9 +2230,9 @@ func TestLifecycleController_SkipsNonExpired(t *testing.T) {
         assert.NotZero(t, result.RequeueAfter)
 
         var updated kimov1alpha1.ChallengeInstance
-        require.NoError(t, client.Get(context.Background(),
-                types.NamespacedName{Name: "active-inst", Namespace: "default"}, &updated))
+        require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: "active-inst", Namespace: "default"}, &updated))
         assert.Equal(t, kimov1alpha1.InstancePhaseRunning, updated.Status.Phase)
+        assert.Empty(t, backend.events)
 }
 ```
 
@@ -1648,6 +2254,7 @@ import (
         "time"
 
         kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
+        "github.com/hermannchristopher/kimo/internal/integrations"
         "k8s.io/apimachinery/pkg/api/errors"
         "k8s.io/apimachinery/pkg/runtime"
         ctrl "sigs.k8s.io/controller-runtime"
@@ -1655,9 +2262,12 @@ import (
         "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const expiringGraceWindow = 60 * time.Second
+
 type LifecycleReconciler struct {
         client.Client
-        Scheme *runtime.Scheme
+        Scheme  *runtime.Scheme
+        Backend integrations.Backend
 }
 
 func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1671,32 +2281,42 @@ func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
                 return ctrl.Result{}, err
         }
 
-        // Skip already expired or failed
-        if instance.Status.Phase == kimov1alpha1.InstancePhaseExpired ||
-                instance.Status.Phase == kimov1alpha1.InstancePhaseFailed {
-                return ctrl.Result{}, nil
-        }
-
-        // No expiry set yet
-        if instance.Status.ExpiresAt == nil {
+        if terminal(instance.Status.Phase) || instance.Status.ExpiresAt == nil {
                 return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
         }
 
         now := time.Now()
-        if now.After(instance.Status.ExpiresAt.Time) {
-                logger.Info("expiring instance", "name", instance.Name)
-                instance.Status.Phase = kimov1alpha1.InstancePhaseExpired
-                instance.Status.Message = "TTL expired"
-                if err := r.Status().Update(ctx, &instance); err != nil {
-                        return ctrl.Result{}, err
-                }
-                // Delete after grace period (60s)
-                return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-        }
-
-        // Requeue before expiry
         remaining := instance.Status.ExpiresAt.Time.Sub(now)
-        return ctrl.Result{RequeueAfter: remaining}, nil
+
+        switch {
+        case remaining <= 0:
+                logger.Info("expiring instance", "name", instance.Name)
+                return r.notifyAndSetPhase(ctx, &instance, kimov1alpha1.InstancePhaseExpired, "TTL expired", integrations.EventExpired, 60*time.Second)
+        case remaining <= expiringGraceWindow && instance.Status.Phase != kimov1alpha1.InstancePhaseExpiring:
+                return r.notifyAndSetPhase(ctx, &instance, kimov1alpha1.InstancePhaseExpiring, "entering expiry grace window", integrations.EventExpiring, remaining)
+        default:
+                return ctrl.Result{RequeueAfter: remaining - expiringGraceWindow}, nil
+        }
+}
+
+func (r *LifecycleReconciler) notifyAndSetPhase(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, phase kimov1alpha1.InstancePhase, reason string, evt integrations.EventType, requeueAfter time.Duration) (ctrl.Result, error) {
+        instance.Status.Phase = phase
+        instance.Status.Reason = reason
+        if err := r.Status().Update(ctx, instance); err != nil {
+                return ctrl.Result{}, err
+        }
+        if r.Backend != nil {
+                _ = r.Backend.Notify(ctx, integrations.Event{
+                        Type:      evt,
+                        Instance:  instance.Name,
+                        Challenge: instance.Spec.TemplateRef,
+                        Team:      instance.Spec.Team,
+                        Player:    instance.Spec.Player,
+                        Endpoint:  instance.Status.Endpoint,
+                        Reason:    reason,
+                })
+        }
+        return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *LifecycleReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -1719,12 +2339,12 @@ Expected: PASS.
 
 ```bash
 git add -A
-git commit -m "feat: implement Lifecycle Controller with TTL expiry"
+git commit -m "feat: implement Lifecycle Controller with Expiring/Expired phases"
 ```
 
 ---
 
-### Task 9: Set Controller
+### Task 11: Set Controller
 
 **Files:**
 - Modify: `internal/controller/challengeset_controller.go`
@@ -1785,13 +2405,15 @@ git commit -m "feat: implement Set Controller with schedule management"
 
 ---
 
-### Task 10: REST API Server — Core
+### Task 12: REST API Server — Core
 
 **Files:**
 - Create: `internal/api/server.go`
 - Create: `internal/api/handlers.go`
 - Create: `internal/api/middleware.go`
 - Create: `internal/api/server_test.go`
+
+Auth is now delegated to the active `integrations.Backend` — the server no longer owns an API key directly.
 
 **Step 1: Add chi dependency**
 
@@ -1807,18 +2429,27 @@ Create `internal/api/server_test.go`:
 package api
 
 import (
-        "encoding/json"
         "net/http"
         "net/http/httptest"
-        "strings"
         "testing"
 
+        "github.com/hermannchristopher/kimo/internal/integrations"
         "github.com/stretchr/testify/assert"
-        "github.com/stretchr/testify/require"
 )
 
+type stubAuthBackend struct{ apiKey string }
+
+func (s *stubAuthBackend) Name() string { return "stub" }
+func (s *stubAuthBackend) Notify(_ context.Context, _ integrations.Event) error { return nil }
+func (s *stubAuthBackend) Authenticate(r *http.Request) (integrations.Principal, error) {
+        if r.Header.Get("Authorization") != "Bearer "+s.apiKey {
+                return integrations.Principal{}, fmt.Errorf("unauthorized")
+        }
+        return integrations.Principal{Subject: "test"}, nil
+}
+
 func TestHealthEndpoint(t *testing.T) {
-        srv := NewServer(nil, "test-key")
+        srv := NewServer(nil, &stubAuthBackend{apiKey: "test-key"})
         req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
         w := httptest.NewRecorder()
         srv.Router().ServeHTTP(w, req)
@@ -1827,7 +2458,7 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestAuthMiddleware_RejectsUnauthenticated(t *testing.T) {
-        srv := NewServer(nil, "secret-key")
+        srv := NewServer(nil, &stubAuthBackend{apiKey: "secret-key"})
         req := httptest.NewRequest(http.MethodGet, "/api/v1/templates", nil)
         w := httptest.NewRecorder()
         srv.Router().ServeHTTP(w, req)
@@ -1836,13 +2467,12 @@ func TestAuthMiddleware_RejectsUnauthenticated(t *testing.T) {
 }
 
 func TestAuthMiddleware_AcceptsValidKey(t *testing.T) {
-        srv := NewServer(nil, "secret-key")
+        srv := NewServer(nil, &stubAuthBackend{apiKey: "secret-key"})
         req := httptest.NewRequest(http.MethodGet, "/api/v1/templates", nil)
         req.Header.Set("Authorization", "Bearer secret-key")
         w := httptest.NewRecorder()
         srv.Router().ServeHTTP(w, req)
 
-        // 200 or empty list, not 401
         assert.NotEqual(t, http.StatusUnauthorized, w.Code)
 }
 ```
@@ -1855,21 +2485,23 @@ Create `internal/api/server.go`:
 package api
 
 import (
+        "context"
         "net/http"
 
         "github.com/go-chi/chi/v5"
         "github.com/go-chi/chi/v5/middleware"
+        "github.com/hermannchristopher/kimo/internal/integrations"
         "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Server struct {
-        client client.Client
-        apiKey string
-        router chi.Router
+        client  client.Client
+        backend integrations.Backend
+        router  chi.Router
 }
 
-func NewServer(c client.Client, apiKey string) *Server {
-        s := &Server{client: c, apiKey: apiKey}
+func NewServer(c client.Client, backend integrations.Backend) *Server {
+        s := &Server{client: c, backend: backend}
         s.setupRoutes()
         return s
 }
@@ -1899,20 +2531,47 @@ func (s *Server) setupRoutes() {
         s.router = r
 }
 
+type principalContextKey struct{}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-                token := r.Header.Get("Authorization")
-                if token != "Bearer "+s.apiKey {
+                principal, err := s.backend.Authenticate(r)
+                if err != nil {
                         http.Error(w, "unauthorized", http.StatusUnauthorized)
                         return
                 }
-                next.ServeHTTP(w, r)
+                ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
+                next.ServeHTTP(w, r.WithContext(ctx))
         })
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleConfigureWebhook only works when the active backend supports runtime
+// webhook registration (today: the generic backend). Other backends return
+// 501 — their integration is configured via Helm values instead.
+func (s *Server) handleConfigureWebhook(w http.ResponseWriter, r *http.Request) {
+        registrar, ok := s.backend.(integrations.WebhookRegistrar)
+        if !ok {
+                http.Error(w, "active scoring backend does not support webhook registration", http.StatusNotImplemented)
+                return
+        }
+        var body struct {
+                URL    string `json:"url"`
+                Secret string `json:"secret"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+                http.Error(w, "invalid body", http.StatusBadRequest)
+                return
+        }
+        if err := registrar.RegisterWebhook(body.URL, body.Secret); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+        }
+        w.WriteHeader(http.StatusOK)
 }
 ```
 
@@ -1930,12 +2589,12 @@ Expected: PASS.
 
 ```bash
 git add -A
-git commit -m "feat: implement REST API server with auth middleware"
+git commit -m "feat: implement REST API server delegating auth to the scoring backend"
 ```
 
 ---
 
-### Task 11: REST API — Instance CRUD Handlers
+### Task 13: REST API — Instance CRUD Handlers
 
 **Files:**
 - Modify: `internal/api/handlers.go`
@@ -1954,6 +2613,8 @@ Each handler interacts with the K8s client:
 - `handleDeleteInstance`: delete CR (cascade deletes owned resources)
 - `handleExtendInstance`: update `spec.ttlOverride`
 
+Lifecycle notifications (`instance.creating`, `instance.running`, ...) are dispatched by the Instance and Lifecycle controllers as phase transitions happen (Tasks 5 and 10) — these handlers only mutate the CR, they never call `Backend.Notify` directly.
+
 **Step 3: Run tests, commit**
 
 ```bash
@@ -1964,7 +2625,7 @@ git commit -m "feat: implement instance CRUD API handlers"
 
 ---
 
-### Task 12: Proof of Work System
+### Task 14: Proof of Work System
 
 **Files:**
 - Create: `internal/api/pow.go`
@@ -1992,11 +2653,9 @@ func TestPoW_GenerateAndVerify(t *testing.T) {
         require.NotEmpty(t, puzzle.Challenge)
         require.Equal(t, 16, puzzle.Difficulty)
 
-        // Solve the puzzle
         nonce, found := SolvePoW(puzzle.Challenge, puzzle.Difficulty)
         require.True(t, found)
 
-        // Verify
         assert.True(t, VerifyPoW(puzzle.Challenge, nonce, puzzle.Difficulty))
 }
 
@@ -2011,7 +2670,6 @@ func TestPoW_LeadingZeroBits(t *testing.T) {
         hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", challenge, nonce)))
         hexHash := hex.EncodeToString(hash[:])
         _ = hexHash
-        // Just verify the helper function works
         assert.GreaterOrEqual(t, countLeadingZeroBits(hash[:]), 0)
 }
 ```
@@ -2096,59 +2754,51 @@ git commit -m "feat: implement Proof of Work system"
 
 ---
 
-### Task 13: Webhook Callback System
-
-**Files:**
-- Create: `internal/api/webhooks.go`
-- Create: `internal/api/webhooks_test.go`
-
-**Step 1: Write the failing test**
-
-Test that registering a webhook URL and dispatching an event sends the correct HMAC-signed POST.
-
-**Step 2: Implement webhook manager**
-
-- In-memory registry of webhook URLs + HMAC secrets
-- `Dispatch(event WebhookEvent)` method that POSTs to all registered URLs
-- HMAC-SHA256 signature in `X-KIMO-Signature` header
-- `handleConfigureWebhook` handler stores URL + secret
-
-**Step 3: Integrate with Instance Controller**
-
-Add webhook dispatch calls when instance phase changes (Pending→Running, →Failed, →Expired, deleted).
-
-**Step 4: Run tests, commit**
-
-```bash
-go test ./internal/api/ -v
-git add -A
-git commit -m "feat: implement webhook callback system with HMAC signatures"
-```
-
----
-
-### Task 14: Wire Up Manager Entrypoint
+### Task 15: Wire Up Manager Entrypoint
 
 **Files:**
 - Modify: `cmd/manager/main.go`
 
-**Step 1: Register all controllers and start API server**
+**Step 1: Resolve the scoring backend from config and register all controllers**
 
 Edit `cmd/manager/main.go` to:
-- Register all 5 controllers with the manager
-- Start the REST API server in a goroutine alongside the manager
-- Read API key from environment variable `KIMO_API_KEY`
-- Read operator config (domain, global instance cap) from env/ConfigMap
+- Read `KIMO_BACKEND` (defaults to `generic`) and `KIMO_BACKEND_CONFIG` (JSON) from the environment
+- Construct the backend via `integrations.New`
+- Register all 5 controllers with the manager, injecting the resolved `Backend` into `ChallengeInstanceReconciler` and `LifecycleReconciler`
+- Start the REST API server in a goroutine, passing it the same `Backend`
 
 ```go
 // In main():
-apiKey := os.Getenv("KIMO_API_KEY")
-apiServer := api.NewServer(mgr.GetClient(), apiKey)
-go func() {
-    if err := http.ListenAndServe(":8080", apiServer.Router()); err != nil {
-        setupLog.Error(err, "API server failed")
+backendName := os.Getenv("KIMO_BACKEND")
+if backendName == "" {
+        backendName = "generic"
+}
+backend, err := integrations.New(backendName, json.RawMessage(os.Getenv("KIMO_BACKEND_CONFIG")))
+if err != nil {
+        setupLog.Error(err, "unable to initialize scoring backend", "backend", backendName)
         os.Exit(1)
-    }
+}
+
+if err = (&controller.ChallengeInstanceReconciler{
+        Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend,
+}).SetupWithManager(mgr); err != nil {
+        setupLog.Error(err, "unable to create controller", "controller", "ChallengeInstance")
+        os.Exit(1)
+}
+if err = (&controller.LifecycleReconciler{
+        Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend,
+}).SetupWithManager(mgr); err != nil {
+        setupLog.Error(err, "unable to create controller", "controller", "Lifecycle")
+        os.Exit(1)
+}
+// ... Template, Network, Set controllers registered the same way (no Backend needed)
+
+apiServer := api.NewServer(mgr.GetClient(), backend)
+go func() {
+        if err := http.ListenAndServe(":8080", apiServer.Router()); err != nil {
+                setupLog.Error(err, "API server failed")
+                os.Exit(1)
+        }
 }()
 ```
 
@@ -2162,12 +2812,12 @@ make build
 
 ```bash
 git add -A
-git commit -m "feat: wire up all controllers and API server in manager"
+git commit -m "feat: wire up all controllers, scoring backend, and API server in manager"
 ```
 
 ---
 
-### Task 15: Discord Bot — Core Setup
+### Task 16: Discord Bot — Core Setup
 
 **Files:**
 - Create: `cmd/bot/main.go`
@@ -2322,7 +2972,7 @@ git commit -m "feat: add Discord bot core setup and KIMO API client"
 
 ---
 
-### Task 16: Discord Bot — Slash Commands
+### Task 17: Discord Bot — Slash Commands
 
 **Files:**
 - Create: `internal/bot/commands.go`
@@ -2351,7 +3001,6 @@ import "github.com/bwmarrin/discordgo"
 
 func (b *Bot) hasRole(member *discordgo.Member, roleName string) bool {
         for _, roleID := range member.Roles {
-                // Compare against configured role IDs
                 if roleID == roleName {
                         return true
                 }
@@ -2379,7 +3028,7 @@ git commit -m "feat: implement Discord bot slash commands and RBAC"
 
 ---
 
-### Task 17: Discord Bot — Event Monitor
+### Task 18: Discord Bot — Event Monitor
 
 **Files:**
 - Create: `internal/bot/monitor.go`
@@ -2387,7 +3036,7 @@ git commit -m "feat: implement Discord bot slash commands and RBAC"
 
 **Step 1: Implement webhook receiver**
 
-The bot runs a small HTTP server that receives KIMO webhook callbacks and posts to Discord:
+The bot runs a small HTTP server that receives events from the `generic` scoring backend's webhook fan-out and posts to Discord. (When a different backend, e.g. `ctfd`, is active, `/monitor` documents that event streaming instead comes from that platform's own tooling.)
 
 ```go
 package bot
@@ -2422,9 +3071,11 @@ func (m *Monitor) formatEvent(event WebhookEvent) *discordgo.MessageEmbed {
         switch event.Event {
         case "instance.failed":
                 color = 0xFF0000
-        case "instance.expired":
+        case "instance.unhealthy":
                 color = 0xFFA500
-        case "instance.pending":
+        case "instance.expiring", "instance.expired":
+                color = 0xFFA500
+        case "instance.creating":
                 color = 0xFFFF00
         }
 
@@ -2447,12 +3098,12 @@ func (m *Monitor) formatEvent(event WebhookEvent) *discordgo.MessageEmbed {
 
 ```bash
 git add -A
-git commit -m "feat: implement Discord bot event monitoring via webhooks"
+git commit -m "feat: implement Discord bot event monitoring via generic backend webhooks"
 ```
 
 ---
 
-### Task 18: Helm Chart
+### Task 19: Helm Chart
 
 **Files:**
 - Create: `helm/kimo/Chart.yaml`
@@ -2476,6 +3127,8 @@ appVersion: "0.1.0"
 
 **Step 2: Create values.yaml**
 
+`integration.backend` selects the scoring backend adapter; `integration.config` is passed through opaque to that adapter.
+
 ```yaml
 operator:
   image: ghcr.io/hermannchristopher/kimo:latest
@@ -2486,7 +3139,11 @@ operator:
 
 api:
   port: 8080
-  apiKey: ""  # set via --set or secret
+
+integration:
+  backend: generic       # generic | ctfd | rctf | <custom, once registered>
+  config: {}              # backend-specific; e.g. for generic: { apiKey: "..." }
+                           #                    for ctfd:    { baseUrl: "...", webhookUrl: "...", apiKey: "..." }
 
 bot:
   enabled: false
@@ -2504,7 +3161,7 @@ global:
 
 **Step 3: Create templates**
 
-Write standard Kubernetes Deployment, Service, ServiceAccount, ClusterRole, ClusterRoleBinding templates for the operator and bot. Include CRD installation.
+Write standard Kubernetes Deployment, Service, ServiceAccount, ClusterRole, ClusterRoleBinding templates for the operator and bot. The operator Deployment sets `KIMO_BACKEND` and `KIMO_BACKEND_CONFIG` env vars from `.Values.integration` (config as a Secret when it contains credentials). Include CRD installation.
 
 **Step 4: Lint chart**
 
@@ -2516,12 +3173,12 @@ helm lint helm/kimo/
 
 ```bash
 git add -A
-git commit -m "feat: add Helm chart for operator and bot deployment"
+git commit -m "feat: add Helm chart with pluggable scoring backend configuration"
 ```
 
 ---
 
-### Task 19: Dockerfile
+### Task 20: Dockerfile
 
 **Files:**
 - Modify: `Dockerfile`
@@ -2560,7 +3217,7 @@ git commit -m "feat: add multi-stage Dockerfile for operator and bot"
 
 ---
 
-### Task 20: Integration Tests (envtest)
+### Task 21: Integration Tests (envtest)
 
 **Files:**
 - Create: `test/integration/suite_test.go`
@@ -2594,8 +3251,10 @@ func TestMain(m *testing.M) {
 **Step 2: Write integration tests**
 
 - Create a ChallengeTemplate → verify status becomes ready
-- Create a ChallengeInstance → verify Deployment and Service created
-- Wait for TTL → verify instance expires
+- Create a ChallengeInstance → verify Deployment and Service created, phase reaches `Creating`
+- Mark the owned Pod ready → verify phase reaches `Running`
+- Wait for TTL → verify instance moves through `Expiring` into `Expired`
+- Use a `recordingBackend` test double (or reuse the one from Task 5) wired into the envtest manager to assert `Notify` fires for each transition
 
 **Step 3: Run**
 
@@ -2612,7 +3271,7 @@ git commit -m "test: add envtest integration tests"
 
 ---
 
-### Task 21: E2E Tests (kind)
+### Task 22: E2E Tests (kind)
 
 **Files:**
 - Create: `test/e2e/e2e_test.go`
@@ -2631,7 +3290,7 @@ make deploy IMG=kimo:e2e
 
 **Step 2: Write E2E test**
 
-Test full flow: apply ChallengeTemplate → POST to API to create instance → verify pod running → verify networking → wait for TTL → verify cleanup.
+Test full flow: apply ChallengeTemplate → POST to API to create instance → verify pod running and phase reaches `Running` → verify networking → wait for TTL → verify phase moves through `Expiring` to `Expired` and cleanup completes.
 
 **Step 3: Commit**
 
@@ -2642,7 +3301,7 @@ git commit -m "test: add E2E tests with kind cluster"
 
 ---
 
-### Task 22: CI Pipeline (GitHub Actions)
+### Task 23: CI Pipeline (GitHub Actions)
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
@@ -2701,18 +3360,18 @@ git commit -m "ci: add GitHub Actions workflow for lint, test, integration, e2e"
 
 ---
 
-### Task 23: Sample Challenge Manifests
+### Task 24: Sample Challenge Manifests
 
 **Files:**
 - Create: `config/samples/web-sqli-template.yaml`
-- Create: `config/samples/pwn-vm-template.yaml`
 - Create: `config/samples/challenge-set.yaml`
+- Create: `config/samples/values-ctfd-backend.yaml`
 
-Create example CRs that demonstrate container and VM challenges, a ChallengeSet with scheduling, and PoW configuration. These serve as documentation and testing fixtures.
+Create example CRs and Helm values that demonstrate a container challenge with PoW and a readiness check, a ChallengeSet with scheduling, and how to point a deployment at the CTFd backend instead of the generic default. These serve as documentation and testing fixtures.
 
 **Step 1: Write samples, commit**
 
 ```bash
 git add -A
-git commit -m "docs: add sample challenge manifests"
+git commit -m "docs: add sample challenge manifests and backend configuration examples"
 ```
