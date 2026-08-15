@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"sync"
 )
@@ -69,9 +70,7 @@ func (b *genericBackend) RegisterWebhook(url, secret string) error {
 func (b *genericBackend) Notify(ctx context.Context, event Event) error {
 	b.mu.RLock()
 	hooks := make(map[string]string, len(b.hooks))
-	for u, s := range b.hooks {
-		hooks[u] = s
-	}
+	maps.Copy(hooks, b.hooks)
 	b.mu.RUnlock()
 
 	payload, err := json.Marshal(event)
@@ -111,7 +110,7 @@ func postSigned(ctx context.Context, url, secret string, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook %s returned %d", url, resp.StatusCode)
 	}

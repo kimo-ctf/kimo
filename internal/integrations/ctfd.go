@@ -83,7 +83,7 @@ func (b *ctfdBackend) Notify(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("ctfd webhook returned %d", resp.StatusCode)
 	}
@@ -109,7 +109,7 @@ func (b *ctfdBackend) Authenticate(r *http.Request) (Principal, error) {
 	if err != nil {
 		return Principal{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return Principal{}, fmt.Errorf("ctfd rejected credentials: %d", resp.StatusCode)
 	}

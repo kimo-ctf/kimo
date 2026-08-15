@@ -50,6 +50,13 @@ linters:
           - lll
         path: api/*
       - linters:
+          # Repeated fixture literals ("default" namespace, sample image
+          # refs, resource names) are normal and clearer inline in tests
+          # than hoisted into named constants — goconst has no path-based
+          # exemption for _test.go out of the box, unlike lll/dupl below.
+          - goconst
+        path: _test\.go
+      - linters:
           - dupl
           - lll
         path: internal/*

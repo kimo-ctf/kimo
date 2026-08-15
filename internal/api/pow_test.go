@@ -45,7 +45,7 @@ func TestPoW_RejectsWrongNonce(t *testing.T) {
 func TestPoW_LeadingZeroBits(t *testing.T) {
 	challenge := "test-challenge"
 	nonce := uint64(12345)
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", challenge, nonce)))
+	hash := sha256.Sum256(fmt.Appendf(nil, "%s:%d", challenge, nonce))
 	hexHash := hex.EncodeToString(hash[:])
 	_ = hexHash
 	assert.GreaterOrEqual(t, countLeadingZeroBits(hash[:]), 0)

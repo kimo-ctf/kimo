@@ -30,8 +30,8 @@ import (
 func TestCTFdBackend_NotifyPostsTranslatedPayload(t *testing.T) {
 	var gotType string
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&body)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotType, _ = body["type"].(string)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -52,8 +52,8 @@ func TestCTFdBackend_AuthenticateValidatesAgainstCTFd(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"data": map[string]interface{}{"id": 1, "name": "team42", "team_id": 42},
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"id": 1, "name": "team42", "team_id": 42},
 		})
 	}))
 	defer ctfd.Close()

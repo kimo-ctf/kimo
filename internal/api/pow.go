@@ -66,7 +66,7 @@ func countLeadingZeroBits(hash []byte) int {
 
 // SolvePoW is a helper for testing — brute-force solver.
 func SolvePoW(challenge string, difficulty int) (uint64, bool) {
-	for nonce := uint64(0); nonce < 1<<30; nonce++ {
+	for nonce := range uint64(1 << 30) {
 		if VerifyPoW(challenge, nonce, difficulty) {
 			return nonce, true
 		}

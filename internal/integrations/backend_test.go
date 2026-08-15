@@ -28,8 +28,8 @@ import (
 
 type stubBackend struct{ name string }
 
-func (s *stubBackend) Name() string                                 { return s.name }
-func (s *stubBackend) Notify(context.Context, Event) error          { return nil }
+func (s *stubBackend) Name() string                                  { return s.name }
+func (s *stubBackend) Notify(context.Context, Event) error           { return nil }
 func (s *stubBackend) Authenticate(*http.Request) (Principal, error) { return Principal{}, nil }
 
 func TestRegistry_RegisterAndNew(t *testing.T) {

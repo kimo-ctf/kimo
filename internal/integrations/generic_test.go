@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,7 +36,7 @@ func TestGenericBackend_NotifySignsPayload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotSig = r.Header.Get("X-KIMO-Signature")
 		body := make([]byte, r.ContentLength)
-		r.Body.Read(body)
+		_, _ = io.ReadFull(r.Body, body)
 		gotBody = string(body)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -44,7 +45,7 @@ func TestGenericBackend_NotifySignsPayload(t *testing.T) {
 	b, err := newGenericBackend(nil)
 	require.NoError(t, err)
 	gb := b.(*genericBackend)
-	gb.RegisterWebhook(srv.URL, "shared-secret")
+	require.NoError(t, gb.RegisterWebhook(srv.URL, "shared-secret"))
 
 	err = gb.Notify(context.Background(), Event{Type: EventRunning, Instance: "web-sqli-team-1"})
 	require.NoError(t, err)

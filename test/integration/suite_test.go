@@ -106,11 +106,24 @@ var _ = BeforeSuite(func() {
 
 	backend = &recordingBackend{}
 
-	Expect((&controller.ChallengeTemplateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&controller.ChallengeInstanceReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&controller.NetworkFenceReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&controller.LifecycleReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&controller.ChallengeSetReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr)).To(Succeed())
+	templateReconciler := &controller.ChallengeTemplateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
+	Expect(templateReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	instanceReconciler := &controller.ChallengeInstanceReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend,
+	}
+	Expect(instanceReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	networkFenceReconciler := &controller.NetworkFenceReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
+	Expect(networkFenceReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	lifecycleReconciler := &controller.LifecycleReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Backend: backend,
+	}
+	Expect(lifecycleReconciler.SetupWithManager(mgr)).To(Succeed())
+
+	setReconciler := &controller.ChallengeSetReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
+	Expect(setReconciler.SetupWithManager(mgr)).To(Succeed())
 
 	var ctx context.Context
 	ctx, cancel = context.WithCancel(context.Background())

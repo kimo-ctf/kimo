@@ -55,7 +55,7 @@ func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	now := time.Now()
-	remaining := instance.Status.ExpiresAt.Time.Sub(now)
+	remaining := instance.Status.ExpiresAt.Sub(now)
 
 	switch {
 	case remaining <= 0:

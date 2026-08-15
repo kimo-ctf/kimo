@@ -136,9 +136,10 @@ func TestTemplateController_MissingImage(t *testing.T) {
 		Build()
 
 	r := &ChallengeTemplateReconciler{Client: client, Scheme: scheme}
-	r.Reconcile(context.Background(), reconcile.Request{
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "test-challenge", Namespace: "default"},
 	})
+	require.NoError(t, err)
 
 	var updated kimov1alpha1.ChallengeTemplate
 	require.NoError(t, client.Get(context.Background(),
@@ -180,9 +181,10 @@ func TestTemplateController_RejectsNonAlwaysRestartPolicy(t *testing.T) {
 		Build()
 
 	r := &ChallengeTemplateReconciler{Client: client, Scheme: scheme}
-	r.Reconcile(context.Background(), reconcile.Request{
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "test-challenge", Namespace: "default"},
 	})
+	require.NoError(t, err)
 
 	var updated kimov1alpha1.ChallengeTemplate
 	require.NoError(t, client.Get(context.Background(),
