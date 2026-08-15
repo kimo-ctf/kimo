@@ -84,7 +84,7 @@ func (r *ChallengeTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Count existing instances
 	var instances kimov1alpha1.ChallengeInstanceList
 	if err := r.List(ctx, &instances, client.MatchingLabels{
-		"kimo.io/challenge": tmpl.Name,
+		kimov1alpha1.LabelChallenge: tmpl.Name,
 	}); err != nil {
 		return ctrl.Result{}, err
 	}

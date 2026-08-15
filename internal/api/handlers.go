@@ -21,8 +21,8 @@ import (
 	"net/http"
 	"time"
 
-	kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
 	"github.com/go-chi/chi/v5"
+	kimov1alpha1 "github.com/hermannchristopher/kimo/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -102,8 +102,8 @@ func (s *Server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 			Name:      instanceName(body.Template, body.Team, body.Player),
 			Namespace: s.namespace,
 			Labels: map[string]string{
-				"kimo.io/challenge": body.Template,
-				"kimo.io/team":      body.Team,
+				kimov1alpha1.LabelChallenge: body.Template,
+				kimov1alpha1.LabelTeam:      body.Team,
 			},
 		},
 		Spec: kimov1alpha1.ChallengeInstanceSpec{
@@ -137,10 +137,10 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 
 	labels := client.MatchingLabels{}
 	if team := r.URL.Query().Get("team"); team != "" {
-		labels["kimo.io/team"] = team
+		labels[kimov1alpha1.LabelTeam] = team
 	}
 	if challenge := r.URL.Query().Get("challenge"); challenge != "" {
-		labels["kimo.io/challenge"] = challenge
+		labels[kimov1alpha1.LabelChallenge] = challenge
 	}
 	if len(labels) > 0 {
 		opts = append(opts, labels)

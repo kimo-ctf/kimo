@@ -122,7 +122,7 @@ func (r *NetworkFenceReconciler) buildNetworkPolicy(fence *kimov1alpha1.NetworkF
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: "kimo-" + fence.Spec.InstanceRef, Namespace: fence.Namespace},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"kimo.io/instance": fence.Spec.InstanceRef}},
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{kimov1alpha1.LabelInstance: fence.Spec.InstanceRef}},
 			Ingress:     ingress,
 			Egress:      egressRules,
 			PolicyTypes: policyTypes,

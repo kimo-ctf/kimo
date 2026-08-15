@@ -79,7 +79,12 @@ func (r *ChallengeInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	if !tmpl.Status.Ready {
-		r.transition(ctx, &instance, kimov1alpha1.InstancePhasePending, "waiting for template to be ready")
+		// Errors from transition were previously silently discarded here —
+		// a failed status update (e.g. a conflict) would report reconcile
+		// success anyway, hiding it. Propagate it instead.
+		if _, err := r.transition(ctx, &instance, kimov1alpha1.InstancePhasePending, "waiting for template to be ready"); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -213,7 +218,7 @@ func (r *ChallengeInstanceReconciler) ensureExpiry(instance *kimov1alpha1.Challe
 func (r *ChallengeInstanceReconciler) determinePhase(ctx context.Context, instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) (kimov1alpha1.InstancePhase, string, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(instance.Namespace),
-		client.MatchingLabels{"kimo.io/instance": instance.Name}); err != nil {
+		client.MatchingLabels{kimov1alpha1.LabelInstance: instance.Name}); err != nil {
 		return "", "", err
 	}
 	if len(pods.Items) == 0 {
@@ -298,9 +303,9 @@ func eventForPhase(phase kimov1alpha1.InstancePhase) (integrations.EventType, bo
 func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.ChallengeInstance, tmpl *kimov1alpha1.ChallengeTemplate) *appsv1.Deployment {
 	replicas := int32(1)
 	labels := map[string]string{
-		"kimo.io/challenge": tmpl.Name,
-		"kimo.io/team":      instance.Spec.Team,
-		"kimo.io/instance":  instance.Name,
+		kimov1alpha1.LabelChallenge: tmpl.Name,
+		kimov1alpha1.LabelTeam:      instance.Spec.Team,
+		kimov1alpha1.LabelInstance:  instance.Name,
 	}
 
 	c := tmpl.Spec.Container
@@ -395,7 +400,7 @@ func (r *ChallengeInstanceReconciler) buildService(instance *kimov1alpha1.Challe
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"kimo.io/instance": instance.Name},
+			Selector: map[string]string{kimov1alpha1.LabelInstance: instance.Name},
 			Ports:    ports,
 		},
 	}
@@ -423,7 +428,7 @@ func (r *ChallengeInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func mapPodToInstance(_ context.Context, obj client.Object) []reconcile.Request {
-	name, ok := obj.GetLabels()["kimo.io/instance"]
+	name, ok := obj.GetLabels()[kimov1alpha1.LabelInstance]
 	if !ok {
 		return nil
 	}
