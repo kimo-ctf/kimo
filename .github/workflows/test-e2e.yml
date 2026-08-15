@@ -33,6 +33,11 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
+        env:
+          # kimo has no admission webhooks (see config/default/kustomization.yaml,
+          # the [WEBHOOK] sections are all commented out) — cert-manager isn't
+          # needed for anything here, so skip installing/tearing it down.
+          CERT_MANAGER_INSTALL_SKIP: "true"
         run: |
           go mod tidy
           make test-e2e

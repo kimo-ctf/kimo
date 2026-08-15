@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -270,17 +271,116 @@ var _ = Describe("Manager", Ordered, func() {
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		Context("Challenge lifecycle", func() {
+			const instanceName = "e2e-smoke-team-1"
+
+			It("provisions a real instance end to end: Deployment, Service, NetworkFence, NetworkPolicy, and a Running Pod", func() {
+				// nginx-unprivileged, not stock nginx: the Instance Controller
+				// enforces RunAsNonRoot, and stock nginx runs as root by
+				// default (confirmed by actually running this — see
+				// docs/kimo-roadmap.md Phase 5).
+				By("applying a flag Secret, ChallengeTemplate, and ChallengeInstance")
+				manifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: e2e-smoke-flag
+  namespace: default
+stringData:
+  flag: "FLAG{e2e-smoke}"
+---
+apiVersion: kimo.kimo.io/v1alpha1
+kind: ChallengeTemplate
+metadata:
+  name: e2e-smoke
+  namespace: default
+spec:
+  category: web
+  instanceMode: perTeam
+  ttl: 10m
+  maxInstances: 10
+  flagSecretRef:
+    name: e2e-smoke-flag
+  container:
+    image: docker.io/nginxinc/nginx-unprivileged:alpine
+    ports:
+      - name: http
+        containerPort: 8080
+        expose: true
+    readiness:
+      type: tcp
+      port: 8080
+    restartPolicy: Always
+    unhealthyThreshold: 3
+---
+apiVersion: kimo.kimo.io/v1alpha1
+kind: ChallengeInstance
+metadata:
+  name: ` + instanceName + `
+  namespace: default
+  labels:
+    kimo.io/challenge: e2e-smoke
+    kimo.io/team: team-1
+spec:
+  templateRef: e2e-smoke
+  team: team-1
+`
+				Expect(applyManifest(manifest)).To(Succeed())
+				DeferCleanup(func() { _ = deleteManifest(manifest) })
+
+				By("verifying the Deployment and Service were created")
+				Eventually(func(g Gomega) {
+					_, err := utils.Run(exec.Command("kubectl", "get", "deployment", instanceName, "-n", "default"))
+					g.Expect(err).NotTo(HaveOccurred())
+					_, err = utils.Run(exec.Command("kubectl", "get", "service", instanceName, "-n", "default"))
+					g.Expect(err).NotTo(HaveOccurred())
+				}).Should(Succeed())
+
+				By("verifying the NetworkFence and the NetworkPolicy it produces were created")
+				Eventually(func(g Gomega) {
+					_, err := utils.Run(exec.Command("kubectl", "get", "networkfence", instanceName, "-n", "default"))
+					g.Expect(err).NotTo(HaveOccurred())
+					_, err = utils.Run(exec.Command("kubectl", "get", "networkpolicy", "kimo-"+instanceName, "-n", "default"))
+					g.Expect(err).NotTo(HaveOccurred())
+				}).Should(Succeed())
+
+				By("waiting for the instance to reach Running — a real Pod, on a real kubelet, passing a real readiness check")
+				Eventually(func(g Gomega) {
+					phase, err := utils.Run(exec.Command("kubectl", "get", "challengeinstance", instanceName,
+						"-n", "default", "-o", "jsonpath={.status.phase}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(Equal("Running"))
+				}, 3*time.Minute, 2*time.Second).Should(Succeed())
+
+				By("deleting the instance and verifying its Deployment is cleaned up via OwnerReferences")
+				_, err := utils.Run(exec.Command("kubectl", "delete", "challengeinstance", instanceName, "-n", "default"))
+				Expect(err).NotTo(HaveOccurred())
+				Eventually(func(g Gomega) {
+					_, err := utils.Run(exec.Command("kubectl", "get", "deployment", instanceName, "-n", "default"))
+					g.Expect(err).To(HaveOccurred())
+				}, 30*time.Second).Should(Succeed())
+			})
+		})
 	})
 })
+
+// applyManifest runs `kubectl apply -f -` with the given YAML piped on stdin.
+func applyManifest(manifest string) error {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+// deleteManifest runs `kubectl delete -f -` with the given YAML piped on
+// stdin, ignoring already-deleted resources — used for cleanup, where the
+// test may have already deleted some of these objects itself.
+func deleteManifest(manifest string) error {
+	cmd := exec.Command("kubectl", "delete", "-f", "-", "--ignore-not-found")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
 // It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
