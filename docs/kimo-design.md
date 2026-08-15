@@ -112,7 +112,11 @@ spec:
       type: tcp                # tcp | http | none (defaults to tcp on first exposed port)
       port: 8080
       path: /healthz           # only for type: http
-    restartPolicy: OnFailure    # OnFailure | Always | Never — maps to Pod restartPolicy
+    restartPolicy: Always        # only Always is supported today — instances are
+                                  # Deployment-managed and Kubernetes requires Always
+                                  # for those; OnFailure/Never are reserved for future
+                                  # bare-Pod support and are rejected by the Template
+                                  # Controller until then
     unhealthyThreshold: 3       # consecutive failed readiness checks before phase -> Unhealthy
 status:
   ready: true
@@ -199,7 +203,7 @@ spec:
 ## Controllers
 
 ### Template Controller
-- Validates ChallengeTemplate specs (image, resources, flag secret, container spec required)
+- Validates ChallengeTemplate specs (image, resources, flag secret, container spec required, `restartPolicy` must be `Always`/omitted — instances are Deployment-managed and Kubernetes rejects any other value there)
 - Sets `status.ready` and tracks `status.instanceCount`
 - Enforces `maxInstances` cap
 
@@ -402,7 +406,7 @@ Bot token in K8s Secret, KIMO API URL + key in ConfigMap.
 
 ### Security Hardening
 - Non-root by default (overridable for pwn challenges)
-- `SecurityContext`: readOnlyRootFilesystem, no_new_privs, dropped capabilities
+- `SecurityContext`: readOnlyRootFilesystem, no_new_privs, dropped capabilities — paired with a writable `/tmp` (`emptyDir`) so the read-only root doesn't outright break ordinary images (confirmed live: stock `nginx` crash-loops on `mkdir /tmp/proxy_temp` without it)
 - Pod Security Standards at namespace level (restricted default, privileged opt-in)
 - Service account token not mounted in challenge pods
 - TLS via cert-manager integration

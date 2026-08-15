@@ -146,3 +146,47 @@ func TestTemplateController_MissingImage(t *testing.T) {
 	assert.False(t, updated.Status.Ready)
 	assert.Contains(t, updated.Status.Message, "image")
 }
+
+// Deployment-managed pods only accept RestartPolicy: Always in Kubernetes;
+// OnFailure/Never would fail Deployment creation in the Instance
+// Controller, so the Template Controller must reject them up front.
+func TestTemplateController_RejectsNonAlwaysRestartPolicy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, kimov1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "flag-secret", Namespace: "default"},
+		Data:       map[string][]byte{"flag": []byte("FLAG{test}")},
+	}
+
+	tmpl := &kimov1alpha1.ChallengeTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-challenge", Namespace: "default"},
+		Spec: kimov1alpha1.ChallengeTemplateSpec{
+			FlagSecretRef: corev1.LocalObjectReference{Name: "flag-secret"},
+			InstanceMode:  kimov1alpha1.InstanceModePerTeam,
+			TTL:           "30m",
+			MaxInstances:  100,
+			Container: kimov1alpha1.ContainerSpec{
+				Image:         "test:latest",
+				RestartPolicy: kimov1alpha1.RestartOnFailure,
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(secret, tmpl).
+		WithStatusSubresource(tmpl).
+		Build()
+
+	r := &ChallengeTemplateReconciler{Client: client, Scheme: scheme}
+	r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-challenge", Namespace: "default"},
+	})
+
+	var updated kimov1alpha1.ChallengeTemplate
+	require.NoError(t, client.Get(context.Background(),
+		types.NamespacedName{Name: "test-challenge", Namespace: "default"}, &updated))
+	assert.False(t, updated.Status.Ready)
+	assert.Contains(t, updated.Status.Message, "restartPolicy")
+}

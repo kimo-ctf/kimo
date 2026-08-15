@@ -153,7 +153,7 @@ type ContainerSpec struct {
         Resources          ResourceRequirements `json:"resources,omitempty"`
         Env                []corev1.EnvVar      `json:"env,omitempty"`
         Readiness          *ReadinessCheck      `json:"readiness,omitempty"`
-        RestartPolicy      RestartPolicy        `json:"restartPolicy,omitempty"`      // default OnFailure
+        RestartPolicy      RestartPolicy        `json:"restartPolicy,omitempty"`      // default Always; only Always is accepted today (see Task 4)
         UnhealthyThreshold int32                `json:"unhealthyThreshold,omitempty"` // default 3
 }
 
@@ -667,6 +667,18 @@ func (r *ChallengeTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Re
         // Validate container spec
         if tmpl.Spec.Container.Image == "" {
                 return r.setStatus(ctx, &tmpl, false, "container image is required")
+        }
+        // Instances are Deployment-managed, and Kubernetes only allows
+        // RestartPolicy: Always on Deployment-managed pods — OnFailure/Never
+        // require a bare Pod, which isn't supported yet. Reject early here
+        // instead of letting Deployment creation fail in the Instance
+        // Controller (found by running the built image against a real
+        // cluster: a template with restartPolicy: OnFailure — the design
+        // doc's own original example — crash-loops the reconciler).
+        switch tmpl.Spec.Container.RestartPolicy {
+        case "", kimov1alpha1.RestartAlways:
+        default:
+                return r.setStatus(ctx, &tmpl, false, "container.restartPolicy: only \"Always\" (or omitted) is supported — instances are Deployment-managed and Kubernetes requires Always for those; OnFailure/Never would need bare-Pod support")
         }
 
         // Count existing instances
@@ -1212,6 +1224,16 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
                         ReadOnlyRootFilesystem:   boolPtr(true),
                         AllowPrivilegeEscalation: boolPtr(false),
                 },
+                // ReadOnlyRootFilesystem breaks most off-the-shelf images
+                // outright — e.g. nginx crashes on startup trying to mkdir
+                // under /tmp (confirmed by actually running this against a
+                // kind cluster). A writable /tmp backed by emptyDir is the
+                // standard middle ground: root filesystem stays read-only,
+                // but scratch space still works without every challenge
+                // author having to build a specially hardened image.
+                VolumeMounts: []corev1.VolumeMount{
+                        {Name: "tmp", MountPath: "/tmp"},
+                },
         }
         for _, p := range c.Ports {
                 container.Ports = append(container.Ports, corev1.ContainerPort{Name: p.Name, ContainerPort: p.ContainerPort})
@@ -1220,14 +1242,12 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
                 container.ReadinessProbe = probe
         }
 
-        restartPolicy := corev1.RestartPolicyOnFailure
-        switch c.RestartPolicy {
-        case kimov1alpha1.RestartAlways:
-                restartPolicy = corev1.RestartPolicyAlways
-        case kimov1alpha1.RestartNever:
-                restartPolicy = corev1.RestartPolicyNever
-        }
-
+        // Kubernetes requires RestartPolicy: Always for any Deployment-managed
+        // pod template — OnFailure/Never are only valid on bare Pods. Instances
+        // are Deployment-managed (for self-healing + ownership), so
+        // c.RestartPolicy is not honored here; the Template Controller (Task 4)
+        // rejects OnFailure/Never at admission time instead of letting this
+        // fail at Deployment-creation time.
         return &appsv1.Deployment{
                 ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace, Labels: labels},
                 Spec: appsv1.DeploymentSpec{
@@ -1237,8 +1257,11 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
                                 ObjectMeta: metav1.ObjectMeta{Labels: labels},
                                 Spec: corev1.PodSpec{
                                         Containers:                   []corev1.Container{container},
-                                        RestartPolicy:                restartPolicy,
+                                        RestartPolicy:                corev1.RestartPolicyAlways,
                                         AutomountServiceAccountToken: boolPtr(false),
+                                        Volumes: []corev1.Volume{
+                                                {Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+                                        },
                                 },
                         },
                 },

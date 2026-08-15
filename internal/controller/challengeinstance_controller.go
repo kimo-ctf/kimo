@@ -261,6 +261,15 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
 			ReadOnlyRootFilesystem:   boolPtr(true),
 			AllowPrivilegeEscalation: boolPtr(false),
 		},
+		// ReadOnlyRootFilesystem breaks most off-the-shelf images outright —
+		// e.g. nginx crashes on startup trying to mkdir under /tmp. A
+		// writable /tmp backed by emptyDir is the standard middle ground:
+		// root filesystem stays read-only, but scratch space still works
+		// without every challenge author having to build a specially
+		// hardened image.
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "tmp", MountPath: "/tmp"},
+		},
 	}
 	for _, p := range c.Ports {
 		container.Ports = append(container.Ports, corev1.ContainerPort{Name: p.Name, ContainerPort: p.ContainerPort})
@@ -269,14 +278,12 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
 		container.ReadinessProbe = probe
 	}
 
-	restartPolicy := corev1.RestartPolicyOnFailure
-	switch c.RestartPolicy {
-	case kimov1alpha1.RestartAlways:
-		restartPolicy = corev1.RestartPolicyAlways
-	case kimov1alpha1.RestartNever:
-		restartPolicy = corev1.RestartPolicyNever
-	}
-
+	// Kubernetes requires RestartPolicy: Always for any Deployment-managed
+	// pod template — OnFailure/Never are only valid on bare Pods. Instances
+	// are Deployment-managed (for self-healing + ownership), so c.RestartPolicy
+	// is not honored here; the Template Controller rejects OnFailure/Never
+	// at admission time with a clear message instead of letting this fail
+	// at Deployment-creation time.
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -286,8 +293,11 @@ func (r *ChallengeInstanceReconciler) buildDeployment(instance *kimov1alpha1.Cha
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					Containers:                   []corev1.Container{container},
-					RestartPolicy:                restartPolicy,
+					RestartPolicy:                corev1.RestartPolicyAlways,
 					AutomountServiceAccountToken: boolPtr(false),
+					Volumes: []corev1.Volume{
+						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					},
 				},
 			},
 		},

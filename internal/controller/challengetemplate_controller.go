@@ -72,6 +72,14 @@ func (r *ChallengeTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if tmpl.Spec.Container.Image == "" {
 		return r.setStatus(ctx, &tmpl, false, "container image is required")
 	}
+	// Instances are Deployment-managed, and Kubernetes only allows
+	// RestartPolicy: Always on Deployment-managed pods — OnFailure/Never
+	// require a bare Pod, which isn't supported yet.
+	switch tmpl.Spec.Container.RestartPolicy {
+	case "", kimov1alpha1.RestartAlways:
+	default:
+		return r.setStatus(ctx, &tmpl, false, "container.restartPolicy: only \"Always\" (or omitted) is supported — instances are Deployment-managed and Kubernetes requires Always for those; OnFailure/Never would need bare-Pod support")
+	}
 
 	// Count existing instances
 	var instances kimov1alpha1.ChallengeInstanceList
