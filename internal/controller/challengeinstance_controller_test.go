@@ -238,3 +238,27 @@ func TestInstanceController_TemplateNotReady(t *testing.T) {
 		types.NamespacedName{Name: "broken-team-1", Namespace: "default"}, &updated))
 	assert.Equal(t, kimov1alpha1.InstancePhasePending, updated.Status.Phase)
 }
+
+// mapPodToInstance is what makes the controller re-reconcile when its
+// workload Pod's readiness changes (Owns() alone can't, since the Pod is
+// two hops from the ChallengeInstance: Deployment -> ReplicaSet -> Pod).
+// A regression here reintroduces the up-to-15s staleness a real
+// integration test caught (see test/integration/instance_test.go).
+func TestMapPodToInstance(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-sqli-team-1-abcde", Namespace: "default",
+			Labels: map[string]string{"kimo.io/instance": "web-sqli-team-1"},
+		},
+	}
+	reqs := mapPodToInstance(context.Background(), pod)
+	require.Len(t, reqs, 1)
+	assert.Equal(t, types.NamespacedName{Name: "web-sqli-team-1", Namespace: "default"}, reqs[0].NamespacedName)
+}
+
+func TestMapPodToInstance_IgnoresPodsWithoutTheLabel(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated-pod", Namespace: "default"},
+	}
+	assert.Empty(t, mapPodToInstance(context.Background(), pod))
+}

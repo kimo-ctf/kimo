@@ -33,7 +33,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // ChallengeInstanceReconciler reconciles a ChallengeInstance object
@@ -357,6 +359,23 @@ func (r *ChallengeInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&kimov1alpha1.ChallengeInstance{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// The workload Pod isn't owned by the ChallengeInstance directly —
+		// it's two hops away (Deployment -> ReplicaSet -> Pod) — so Owns()
+		// alone never triggers a reconcile when its readiness changes.
+		// Without this, determinePhase's Pod-health-driven transitions only
+		// ever fire on the periodic RequeueAfter, not reactively (found via
+		// a real envtest+manager integration test: Running was never
+		// reached within a generous timeout because nothing re-triggered
+		// reconciliation after the simulated Pod became Ready).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToInstance)).
 		Named("challengeinstance").
 		Complete(r)
+}
+
+func mapPodToInstance(_ context.Context, obj client.Object) []reconcile.Request {
+	name, ok := obj.GetLabels()["kimo.io/instance"]
+	if !ok {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: name, Namespace: obj.GetNamespace()}}}
 }
