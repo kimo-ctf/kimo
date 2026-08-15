@@ -1,0 +1,50 @@
+# Example ChallengeTemplate for a web challenge with PoW and a TCP
+# readiness check. Fields and defaults here were validated live against a
+# real kind cluster (see docs/kimo-roadmap.md Phase 5) — restartPolicy must
+# be Always (or omitted) since instances are Deployment-managed, and the
+# container image should tolerate a read-only root filesystem (KIMO mounts
+# a writable /tmp via emptyDir, but nothing else is writable by default).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: web-sqli-101-flag
+type: Opaque
+stringData:
+  flag: "FLAG{sql1_1nj3ct10n_1s_fun}"
+---
+apiVersion: kimo.kimo.io/v1alpha1
+kind: ChallengeTemplate
+metadata:
+  name: web-sqli-101
+spec:
+  category: web
+  difficulty: easy
+  points: 100
+  flagSecretRef:
+    name: web-sqli-101-flag
+  instanceMode: perTeam
+  ttl: 30m
+  maxInstances: 200
+  pow:
+    enabled: true
+    difficulty: 20
+    algorithm: sha256
+    ttl: 5m
+  container:
+    image: registry.ctf.io/challenges/web-sqli:v1
+    ports:
+      - name: http
+        containerPort: 8080
+        expose: true
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    env:
+      - name: FLAG
+        valueFrom:
+          secretKeyRef: { name: web-sqli-101-flag, key: flag }
+    readiness:
+      type: tcp
+      port: 8080
+    restartPolicy: Always
+    unhealthyThreshold: 3

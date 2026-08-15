@@ -1,0 +1,12 @@
+# Example Helm values for pointing a KIMO deployment at CTFd instead of the
+# zero-config generic (HMAC-webhook) backend. Apply with:
+#   helm install kimo helm/kimo/ -f config/samples/values-ctfd-backend.yaml
+#
+# See internal/integrations/ctfd.go and docs/kimo-design.md#scoring-backend-integrations
+# for what this backend actually does with Notify/Authenticate.
+integration:
+  backend: ctfd
+  config:
+    baseUrl: https://ctf.example.com
+    webhookUrl: https://ctf.example.com/api/v1/kimo/webhook
+    apiKey: "replace-me"

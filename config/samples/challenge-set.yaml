@@ -1,0 +1,14 @@
+# Example ChallengeSet bulk-scheduling two challenges for a competition
+# round. Requires the referenced ChallengeTemplates (see
+# web-sqli-template.yaml for one of them) to already exist.
+apiVersion: kimo.kimo.io/v1alpha1
+kind: ChallengeSet
+metadata:
+  name: round-1
+spec:
+  challenges:
+    - web-sqli-101
+    - web-xss-201
+  schedule:
+    startAt: "2026-09-01T10:00:00Z"
+    endAt: "2026-09-01T18:00:00Z"
