@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kimo.fullname" . }}
+  labels:
+    {{- include "kimo.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kimo.labels" . | nindent 6 }}
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        {{- include "kimo.labels" . | nindent 8 }}
+        control-plane: controller-manager
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+    spec:
+      serviceAccountName: {{ include "kimo.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          command: ["/manager"]
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            - name: api
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+          env:
+            - name: KIMO_BACKEND
+              value: {{ .Values.integration.backend | quote }}
+            - name: KIMO_BACKEND_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.integration.existingConfigSecret | default (printf "%s-backend-config" (include "kimo.fullname" .)) }}
+                  key: config
+            - name: KIMO_MAX_INSTANCES
+              value: {{ .Values.global.maxInstances | quote }}
+            - name: KIMO_CTF_DOMAIN
+              value: {{ .Values.ctfDomain | quote }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}

@@ -1,0 +1,50 @@
+operator:
+  image:
+    repository: ghcr.io/hermannchristopher/kimo
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 128Mi }
+
+api:
+  port: 8080
+
+# Selects and configures the active scoring backend adapter
+# (internal/integrations). `config` is passed through opaque to whichever
+# backend `backend` names — see docs/kimo-design.md#scoring-backend-integrations.
+integration:
+  backend: generic # generic | ctfd | rctf | <custom, once registered>
+  # backend-specific config, e.g.:
+  #   generic: { apiKey: "..." }
+  #   ctfd:    { baseUrl: "https://ctf.example.com", webhookUrl: "...", apiKey: "..." }
+  config: {}
+  # If config contains credentials, set this instead and it's mounted from
+  # a Secret rather than templated into a ConfigMap/env var directly.
+  existingConfigSecret: ""
+
+# NOTE: the Discord bot (cmd/bot, internal/bot) is not implemented yet —
+# it was built and then reverted during initial development. This section
+# is here so the chart's shape matches docs/kimo-design.md and doesn't need
+# restructuring once the bot returns; leave `enabled: false` until then.
+bot:
+  enabled: false
+  image:
+    repository: ghcr.io/hermannchristopher/kimo-bot
+    tag: latest
+    pullPolicy: IfNotPresent
+  discordToken: ""
+  kimoApiUrl: "http://kimo:8080"
+  kimoApiKey: ""
+  adminRole: ""
+  orgRole: ""
+
+ctfDomain: ctf.example.com
+
+global:
+  maxInstances: 1000
+
+serviceAccount:
+  create: true
+  name: ""

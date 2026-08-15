@@ -1,0 +1,60 @@
+{{- if .Values.bot.enabled }}
+{{- /*
+  The Discord bot (cmd/bot, internal/bot) is not implemented yet — see the
+  note in values.yaml. This template is here so the chart doesn't need
+  restructuring once it lands; enabling it before then will fail to pull
+  a real image.
+*/}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "kimo.fullname" . }}-bot
+  labels:
+    {{- include "kimo.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  discordToken: {{ .Values.bot.discordToken | quote }}
+  kimoApiKey: {{ .Values.bot.kimoApiKey | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kimo.fullname" . }}-bot
+  labels:
+    {{- include "kimo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kimo.labels" . | nindent 6 }}
+      app.kubernetes.io/component: bot
+  template:
+    metadata:
+      labels:
+        {{- include "kimo.labels" . | nindent 8 }}
+        app.kubernetes.io/component: bot
+    spec:
+      serviceAccountName: {{ include "kimo.serviceAccountName" . }}
+      containers:
+        - name: bot
+          image: "{{ .Values.bot.image.repository }}:{{ .Values.bot.image.tag }}"
+          imagePullPolicy: {{ .Values.bot.image.pullPolicy }}
+          env:
+            - name: DISCORD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kimo.fullname" . }}-bot
+                  key: discordToken
+            - name: KIMO_API_URL
+              value: {{ .Values.bot.kimoApiUrl | quote }}
+            - name: KIMO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kimo.fullname" . }}-bot
+                  key: kimoApiKey
+            - name: DISCORD_ADMIN_ROLE
+              value: {{ .Values.bot.adminRole | quote }}
+            - name: DISCORD_ORG_ROLE
+              value: {{ .Values.bot.orgRole | quote }}
+{{- end }}

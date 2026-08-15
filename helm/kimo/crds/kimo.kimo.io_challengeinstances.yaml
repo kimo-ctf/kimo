@@ -1,0 +1,109 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: challengeinstances.kimo.kimo.io
+spec:
+  group: kimo.kimo.io
+  names:
+    kind: ChallengeInstance
+    listKind: ChallengeInstanceList
+    plural: challengeinstances
+    singular: challengeinstance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.templateRef
+      name: Challenge
+      type: string
+    - jsonPath: .spec.team
+      name: Team
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.endpoint
+      name: Endpoint
+      type: string
+    - jsonPath: .status.expiresAt
+      name: Expires
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ChallengeInstance is the Schema for the challengeinstances API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of ChallengeInstance
+            properties:
+              player:
+                type: string
+              team:
+                type: string
+              templateRef:
+                type: string
+              ttlOverride:
+                type: string
+            required:
+            - team
+            - templateRef
+            type: object
+          status:
+            description: status defines the observed state of ChallengeInstance
+            properties:
+              endpoint:
+                type: string
+              expiresAt:
+                format: date-time
+                type: string
+              message:
+                type: string
+              phase:
+                description: InstancePhase represents the lifecycle phase of an instance.
+                enum:
+                - Pending
+                - Creating
+                - Running
+                - Unhealthy
+                - Expiring
+                - Expired
+                - Terminating
+                - Failed
+                type: string
+              podName:
+                type: string
+              reason:
+                type: string
+              startedAt:
+                format: date-time
+                type: string
+              unhealthyCount:
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
