@@ -49,7 +49,3 @@ No local toolchain required — `hack/dev.sh` runs Go/kubebuilder/Helm commands 
 hack/dev.sh go build ./...
 hack/dev.sh go test ./...
 ```
-
-## Status
-
-Core CRDs, controllers, the REST API, PoW, and the Helm chart are implemented and tested (unit tests plus a real envtest integration suite). The Discord bot is not currently in the tree — see `docs/kimo-roadmap.md` for details.
